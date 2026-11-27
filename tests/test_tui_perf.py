@@ -713,3 +713,123 @@ def test_tool_activity_group_spinner_skips_body_updates_during_thinking(
             assert no_exception(app)
 
     asyncio.run(scenario())
+
+
+# -- 12. Gemini WebUI layout --------------------------------------------------
+
+
+def test_webui_centering_empty_vertical_and_routing_pill_visibility(
+    tmp_path: Path,
+) -> None:
+    from rich.text import Text
+
+    async def scenario() -> None:
+        app = make_app(tmp_path, ui_mode="webui")
+        async with app.run_test(size=(140, 42)) as pilot:
+            assert await wait_until(
+                pilot,
+                lambda: bool(app.query(HomeHero))
+                and app.query_one("#home-hero").region.width > 0,
+                2.0,
+            )
+            await pilot.pause()
+
+            assert app.screen.has_class("ui-empty")
+            main_pane = app.query_one("#main-pane")
+            hero = app.query_one("#home-hero")
+            composer = app.query_one("#composer-container")
+            for widget in (main_pane, hero, composer):
+                assert widget.region.width <= 92
+                assert abs((widget.region.x + widget.region.width / 2) - 70.0) <= 1.0
+            # Landing keeps the hero and composer vertically grouped, not glued
+            # to the top edge.
+            assert hero.region.y >= 10
+            assert composer.region.y < 34
+
+            composer_box = app.query_one(ComposerBox)
+            composer_box.focus_input()
+            composer_box.input.load_text("Hello Nexus, test centering")
+            await pilot.pause()
+            await pilot.press("enter")
+
+            assert await wait_until(
+                pilot,
+                lambda: not app._busy
+                and bool(app.query(UserMessageCard))
+                and bool(app.query(AssistantMessageCard)),
+                8.0,
+            )
+            await pilot.pause()
+            assert not app.screen.has_class("ui-empty")
+
+            main_pane = app.query_one("#main-pane")
+            composer = app.query_one("#composer-container")
+            assert abs((composer.region.x + composer.region.width / 2) - 70.0) <= 1.0
+            assistant = app.query_one(".assistant-card")
+            assert abs((assistant.region.x + assistant.region.width / 2) - 70.0) <= 1.5
+            user = app.query_one(".user-card")
+            assert user.region.right <= main_pane.region.right
+            pills = app.query(RoutingPill)
+            assert len(pills) >= 1
+            assert all(pill.display is False for pill in pills)
+
+            # Wireframe notes must fit the 92-column reading column without
+            # wrapping a rendered table line.
+            composer_box.focus_input()
+            composer_box.input.load_text("/stats")
+            await pilot.pause()
+            await pilot.press("enter")
+            assert await wait_until(
+                pilot, lambda: bool(app.query(".system-note")), 5.0
+            )
+            await pilot.pause()
+
+            note = app.query(".system-note").last()
+            main_pane = app.query_one("#main-pane")
+            assert note.region.right <= main_pane.region.right
+            usable = note.content_size.width
+            assert usable > 0
+            rendered = str(note.render())
+            longest = max((len(line.rstrip()) for line in rendered.splitlines()), default=0)
+            assert longest <= usable
+
+            # /routes must preserve uppercase bracket tier badges verbatim and
+            # keep every bordered table row aligned.
+            composer_box.focus_input()
+            composer_box.input.load_text("/routes")
+            await pilot.pause()
+            await pilot.press("enter")
+            assert await wait_until(
+                pilot, lambda: len(app.query(".system-note")) >= 2, 5.0
+            )
+            await pilot.pause()
+            routes_note = app.query(".system-note").last()
+            routes_rendered = str(routes_note.render())
+            assert "[FREE $0]" in routes_rendered
+            bordered = [line.rstrip() for line in routes_rendered.splitlines() if line.startswith(("┌", "│", "├", "└"))]
+            assert bordered
+            assert len({len(line) for line in bordered}) == 1
+            assert len(bordered[0]) <= routes_note.content_size.width
+
+            # CLI mode is unchanged: routing pill and tab bar come back.
+            await pilot.press("ctrl+g")
+            await pilot.pause()
+            assert app.ui_mode == "cli"
+            assert app.query_one("#tab-bar").display is True
+            assert all(pill.display is True for pill in app.query(RoutingPill))
+
+            await pilot.press("ctrl+g")
+            await pilot.pause()
+            assert app.ui_mode == "webui"
+            await pilot.resize_terminal(80, 24)
+            assert await wait_until(
+                pilot,
+                lambda: app.query_one("#composer-container").region.width > 0,
+                2.0,
+            )
+            await pilot.pause()
+            composer = app.query_one("#composer-container")
+            assert abs((composer.region.x + composer.region.width / 2) - 40.0) <= 1.0
+            assert no_exception(app)
+
+    asyncio.run(scenario())

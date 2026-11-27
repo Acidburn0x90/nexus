@@ -719,6 +719,7 @@ class RoutingPill(Static):
     """
 
     def __init__(self, text: str = "", **kwargs: Any) -> None:
+        kwargs.setdefault("classes", "routing-pill")
         super().__init__(text, **kwargs)
 
     def set_decision(
@@ -2345,13 +2346,13 @@ class HintFooter(Static):
     """Single-line keybind hint strip."""
 
     DEFAULT_HINTS = (
-        "[dim]Enter[/] send  [dim]⇧Enter[/] newline  [dim]Tab[/] accept  "
-        "[dim]↑/↓[/] history  [dim]Ctrl+B[/] sidebar  [dim]Ctrl+P[/] commands  "
-        "[dim]Ctrl+O[/] thinking/tools  [dim]Ctrl+Q[/] quit"
+        "[bold]Enter[/] send · [bold]⇧Enter[/] newline · [bold]Tab[/] accept · "
+        "[bold]↑/↓[/] history · [bold]Ctrl+B[/] sidebar · [bold]Ctrl+P[/] commands · "
+        "[bold]Ctrl+O[/] tools · [bold]Ctrl+Q[/] quit"
     )
     WEBUI_HINTS = (
-        "[dim]Enter[/] send  [dim]⇧Enter[/] newline  [dim]Ctrl+G[/] CLI mode  "
-        "[dim]Ctrl+P[/] commands  [dim]Ctrl+Q[/] quit"
+        "[bold]Enter[/] send · [bold]⇧Enter[/] newline · [bold]Ctrl+G[/] CLI mode · "
+        "[bold]Ctrl+P[/] commands · [bold]Ctrl+Q[/] quit"
     )
 
     DEFAULT_CSS = """

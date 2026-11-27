@@ -214,6 +214,7 @@ ModalScreen {
 /* Gemini WebUI single-prompt reading layout */
 Screen.ui-webui #tab-bar,
 Screen.ui-webui #sidebar,
+Screen.ui-webui RoutingPill,
 Screen.ui-webui .routing-pill,
 Screen.ui-webui .assistant-receipt,
 Screen.ui-webui #composer-meta,
@@ -224,22 +225,43 @@ Screen.ui-webui #home-hero .hero-tip {
     display: none;
 }
 
+Screen.ui-webui #workspace {
+    align-horizontal: center;
+}
+
 Screen.ui-webui #main-pane {
+    width: 100%;
+    max-width: 92;
     align-horizontal: center;
 }
 
 Screen.ui-webui #transcript {
+    /* Textual 8 resolves `1fr` against the padding box for scroll containers,
+       which shaved 4 columns and pulled the reading column left of centre. */
+    width: 100%;
     scrollbar-gutter: stable;
     padding: 1 2;
-    align-horizontal: center;
+}
+
+Screen.ui-webui.ui-empty #main-pane {
+    align: center middle;
+}
+
+Screen.ui-webui.ui-empty #transcript {
+    height: auto;
+    padding: 0 2;
+}
+
+Screen.ui-webui.ui-empty #home-hero {
+    margin: 0 0 2 0;
+    padding: 0 2;
 }
 
 Screen.ui-webui #home-hero {
-    max-width: 88;
-    width: 100%;
+    width: 1fr;
     background: transparent;
     border: none;
-    margin: 4 2;
+    margin: 2 0;
     padding: 1 2;
 }
 
@@ -247,18 +269,19 @@ Screen.ui-webui .user-card,
 Screen.ui-webui .tool-group,
 Screen.ui-webui .assistant-card,
 Screen.ui-webui .council-grid,
-Screen.ui-webui .system-note,
-Screen.ui-webui #composer-container,
-Screen.ui-webui #suggestion-popup {
-    max-width: 88;
-    width: 100%;
+Screen.ui-webui .system-note {
+    width: 1fr;
 }
 
 Screen.ui-webui .user-card {
     border: none;
     background: $surface;
     padding: 1 2;
-    margin: 1 0 1 8;
+    margin: 1 0 1 6;
+}
+
+Screen.ui-webui .tool-group {
+    margin: 0 0 1 0;
 }
 
 Screen.ui-webui .assistant-card {
@@ -269,6 +292,7 @@ Screen.ui-webui .assistant-card {
 }
 
 Screen.ui-webui #composer-container {
+    width: 1fr;
     border: round $border-blurred;
     background: $panel;
     padding: 0 1;
@@ -277,6 +301,11 @@ Screen.ui-webui #composer-container {
 
 Screen.ui-webui #composer-container:focus-within {
     border: round $primary;
+}
+
+Screen.ui-webui #suggestion-popup {
+    width: 1fr;
+    margin: 0 2;
 }
 
 Screen.ui-webui #composer-input {

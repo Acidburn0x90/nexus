@@ -28,6 +28,7 @@ import time
 from typing import Any, Callable, Optional
 
 from rich.markup import escape
+from rich.text import Text
 from textual import events, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
@@ -590,6 +591,43 @@ class NexusApp(App[None]):
         except NoMatches:
             return None
 
+    def _sync_empty_state(self, *, empty: Optional[bool] = None) -> None:
+        """Mirror the WebUI empty state onto the screen for CSS centring."""
+        if empty is None:
+            session = self.active_session
+            transcript = self._transcript()
+            no_items = session is None or not session.items
+            only_hero = transcript is None or all(
+                isinstance(child, HomeHero) for child in transcript.children
+            )
+            empty = no_items and only_hero
+        try:
+            self.screen.set_class(bool(empty), "ui-empty")
+        except Exception:
+            # The screen can be gone while a worker finishes an unmount.
+            pass
+
+    def _note_width(self) -> int:
+        """Width for wireframe notes that fits inside a `.system-note`."""
+        width = 0
+        transcript = self._transcript()
+        if transcript is not None:
+            try:
+                if transcript.is_mounted and transcript.content_size.width > 0:
+                    width = int(transcript.content_size.width)
+            except Exception:
+                width = 0
+        if width <= 0:
+            screen_w = self.size.width or 108
+            if self._ui_mode == "webui":
+                avail = min(92, screen_w)
+            else:
+                avail = screen_w - (44 if self._sidebar_open else 0)
+            width = avail - 8
+        # `.system-note` spends a column on its left border and one on each
+        # side of padding, and the stable scrollbar gutter takes another.
+        return max(48, min(96, width - 6))
+
     def _mount(self, *widgets: Any) -> None:
         transcript = self._transcript()
         if transcript is None:
@@ -598,8 +636,9 @@ class NexusApp(App[None]):
         self._scroll_transcript()
 
     def _mount_note(self, title: str, body: str) -> None:
-        note = Static(f"[bold]{escape(title)}[/]\n{escape(body)}", classes="system-note")
+        note = Static(Text.assemble((title, "bold"), "\n", body), classes="system-note")
         self._mount(note)
+        self._sync_empty_state(empty=False)
 
     def _scroll_transcript(self) -> None:
         transcript = self._transcript()
@@ -630,6 +669,7 @@ class NexusApp(App[None]):
             and isinstance(transcript.children[0], HomeHero)
         ):
             self._render_generation += 1
+            self._sync_empty_state()
             return
         self._render_generation += 1
         generation = self._render_generation
@@ -645,6 +685,7 @@ class NexusApp(App[None]):
         session = self.active_session
         if session is None or not session.items:
             transcript.mount(HomeHero(ui_mode=self._ui_mode))
+            self._sync_empty_state()
             return
         widgets = []
         for item in session.items:
@@ -653,6 +694,7 @@ class NexusApp(App[None]):
                 widgets.append(widget)
         if widgets:
             transcript.mount(*widgets)
+        self._sync_empty_state()
         self.call_after_refresh(self._sync_council_layout)
         self._scroll_transcript()
 
@@ -816,6 +858,7 @@ class NexusApp(App[None]):
         except NoMatches:
             pass
         self._update_hints()
+        self._sync_empty_state()
         if persist:
             self.config["ui_mode"] = target
             self._save_config()
@@ -952,7 +995,7 @@ class NexusApp(App[None]):
         arg = argument.strip()
         if not arg:
             profiles = list_profiles()
-            width = max(68, min(104, (self.size.width or 104) - 8))
+            width = self._note_width()
             active_name = self._active_profile_for(self.active_session).name
             rows = [
                 f"{'* ' if prof.name == active_name else '  '}{prof.name:<14} [{prof.mode:<8}] {prof.description}"
@@ -1026,7 +1069,7 @@ class NexusApp(App[None]):
             return
         events = read_events(path=self.events_path, limit=1000)
         stats = compute_performance_stats(events, group_by=group_by)
-        width = max(72, min(108, (self.size.width or 108) - 8))
+        width = self._note_width()
         table = render_stats_table(stats, group_by=group_by, color=False, width=width)
         try:
             from nexus.evolve import detect_improvement_opportunities
@@ -1679,6 +1722,7 @@ class NexusApp(App[None]):
                 transcript.query_one(HomeHero).remove()
             except NoMatches:
                 pass
+            self._sync_empty_state(empty=False)
             transcript.mount(user_card)
             indicator = ThinkingDots(
                 label="council · routing" if force_council else "routing",
@@ -1840,18 +1884,18 @@ class NexusApp(App[None]):
         self.notify(f"Theme → {resolved}", timeout=2)
 
     def _show_routes(self) -> None:
-        width = max(72, min(110, (self.size.width or 110) - 8))
+        width = self._note_width()
         text = render_routes_table(self.routes_data, color=False, width=width)
         self._mount_note("SPECIALIST ROUTES", text)
 
     def _show_tree(self, trace_id: Optional[str]) -> None:
         events = read_events(path=self.events_path, limit=400, trace_id=trace_id)
-        width = max(64, min(110, (self.size.width or 110) - 8))
+        width = self._note_width()
         text = render_delegation_tree(events, trace_id=trace_id, color=False, width=width)
         self._mount_note("DELEGATION TREE", text)
 
     def _show_square(self) -> None:
-        width = max(64, min(110, (self.size.width or 110) - 8))
+        width = self._note_width()
         text = render_square_view(
             limit=10,
             square_path=self.square_path,
@@ -1875,7 +1919,7 @@ class NexusApp(App[None]):
         except ValueError as exc:
             self.notify(f"SIM error: {exc}", severity="error", timeout=4)
             return
-        width = max(64, min(110, (self.size.width or 110) - 8))
+        width = self._note_width()
         summary = render_sim_summary(ledger, color=False, width=width)
         try:
             from nexus.evolve import detect_improvement_opportunities
