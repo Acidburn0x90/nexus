@@ -12,6 +12,7 @@ ids and prompts before dispatch.
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import json
 import os
 import re
@@ -19,6 +20,7 @@ import shutil
 from statistics import median
 import subprocess
 import tempfile
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -35,6 +37,7 @@ DEFAULT_POLICY_PATH = Path(__file__).resolve().parent.parent / "config" / "sim_p
 DEFAULT_BENCHMARK_PATH = (
     Path(__file__).resolve().parent.parent / "config" / "evals" / "routing_benchmark.json"
 )
+DEFAULT_PARETO_PATH = Path.home() / ".local" / "state" / "nexus" / "pareto_archive.json"
 
 # Security boundaries that are permanently outside editable scope, no matter
 # what a policy file or caller requests.
@@ -42,6 +45,9 @@ IMMUTABLE_LOCKED_FILES: tuple[str, ...] = (
     "nexus/sim.py",
     "nexus/evolve.py",
     "nexus/drops.py",
+    "nexus/assay.py",
+    "nexus/errata.py",
+    "nexus/contract.py",
     "config/sim_policy.json",
     "config/policies",
     "config/evals",
@@ -390,6 +396,52 @@ class ScopePolicy:
         return (not errors, errors)
 
 
+_SANDBOX_SECRET_MARKERS: tuple[str, ...] = (
+    "API_KEY",
+    "SECRET",
+    "TOKEN",
+    "PASSWORD",
+    "PASSWD",
+    "CREDENTIAL",
+    "COOKIE",
+    "AUTH",
+    "PRIVATE_KEY",
+)
+
+
+def build_sandbox_env(
+    sandbox_root: Path,
+    *,
+    extra: Optional[dict[str, str]] = None,
+) -> dict[str, str]:
+    """Return a sanitized subprocess environment with credentials stripped and egress blocked."""
+    env: dict[str, str] = {}
+    for key, val in os.environ.items():
+        upper = key.upper()
+        if any(marker in upper for marker in _SANDBOX_SECRET_MARKERS):
+            continue
+        env[key] = val
+    env.update(
+        {
+            "NEXUS_SANDBOX": "1",
+            "NEXUS_EVAL_WORKSPACE": str(sandbox_root),
+            "HTTP_PROXY": "http://127.0.0.1:9",
+            "HTTPS_PROXY": "http://127.0.0.1:9",
+            "ALL_PROXY": "http://127.0.0.1:9",
+            "http_proxy": "http://127.0.0.1:9",
+            "https_proxy": "http://127.0.0.1:9",
+            "all_proxy": "http://127.0.0.1:9",
+            "NO_PROXY": "",
+            "no_proxy": "",
+            "PIP_NO_INDEX": "1",
+        }
+    )
+    if extra:
+        for k, v in extra.items():
+            env[str(k)] = str(v)
+    return env
+
+
 # ---------------------------------------------------------------------------
 # Benchmark spec
 
@@ -631,9 +683,7 @@ def evaluate_split(
         traces = {
             str(task["id"]): "verifier produced no verdict for this task" for task in tasks
         }
-        env = dict(os.environ)
-        env["NEXUS_EVAL_SPLIT"] = split
-        env["NEXUS_EVAL_WORKSPACE"] = str(workspace)
+        env = build_sandbox_env(workspace, extra={"NEXUS_EVAL_SPLIT": split})
         t0 = time.monotonic()
         try:
             proc = subprocess.run(
@@ -874,6 +924,361 @@ def _assert_no_proposal_leak(candidate: dict, spec: BenchmarkSpec) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Pareto archive (E2), GEPA trajectory feedback (E3), explorer split (E6)
+
+
+def resolve_pareto_path(override: Optional[Path] = None) -> Path:
+    """Resolve the Pareto elite archive path (override > env > default)."""
+    if override is not None:
+        return Path(override).expanduser()
+    raw = str(os.environ.get("NEXUS_PARETO_PATH") or "").strip()
+    if raw:
+        return Path(raw).expanduser()
+    return DEFAULT_PARETO_PATH
+
+
+def _candidate_objectives(entry: dict) -> tuple[float, float, float, int]:
+    """Return `(score, open_model_rate, latency_ms, tokens_total)` for Pareto dominance."""
+    metrics = entry.get("metrics") or {}
+    if "open_model_rate" in metrics:
+        raw_open = metrics.get("open_model_rate")
+    elif "zero_cost_ratio" in metrics:
+        raw_open = metrics.get("zero_cost_ratio")
+    else:
+        raw_open = entry.get("open_model_rate", 0.0)
+    return (
+        float(entry.get("score") or 0.0),
+        float(raw_open or 0.0),
+        float(entry.get("latency_ms") or 0.0),
+        int(entry.get("tokens_total") or 0),
+    )
+
+
+def compute_pareto_front(candidates: list[dict]) -> list[dict]:
+    """Return non-dominated valid candidates across accuracy, $0 open-model share, latency, and tokens."""
+    valid: list[dict] = []
+    for cand in candidates or []:
+        if not isinstance(cand, dict):
+            continue
+        if "scope_ok" in cand and not cand.get("scope_ok"):
+            continue
+        if cand.get("error") or cand.get("regressed"):
+            continue
+        raw_score = cand.get("score")
+        if raw_score is None or isinstance(raw_score, bool):
+            continue
+        valid.append(cand)
+
+    def _dominates(a: dict, b: dict) -> bool:
+        sa, oa, la, ta = _candidate_objectives(a)
+        sb, ob, lb, tb = _candidate_objectives(b)
+        if sa < sb or oa < ob:
+            return False
+        strictly = (sa > sb) or (oa > ob)
+        if la > 0 and lb > 0:
+            if la > lb:
+                return False
+            if la < lb:
+                strictly = True
+        if ta > 0 and tb > 0:
+            if ta > tb:
+                return False
+            if ta < tb:
+                strictly = True
+        return strictly
+
+    front: list[dict] = []
+    for idx, cand in enumerate(valid):
+        if any(_dominates(other, cand) for jdx, other in enumerate(valid) if jdx != idx):
+            continue
+        front.append(cand)
+    front.sort(
+        key=lambda c: (
+            -_candidate_objectives(c)[0],
+            -_candidate_objectives(c)[1],
+            _candidate_objectives(c)[2],
+            str(c.get("sample") or ""),
+        )
+    )
+    return front
+
+
+def _compact_pareto_entry(entry: dict, *, round_num: int, benchmark: str, objective: str) -> dict:
+    score, open_rate, lat, tok = _candidate_objectives(entry)
+    return {
+        "sample": str(entry.get("sample") or ""),
+        "round": int(entry.get("round") or round_num),
+        "benchmark": str(entry.get("benchmark") or benchmark),
+        "objective": str(entry.get("objective") or objective),
+        "score": round(score, 6),
+        "passed": int(entry.get("passed") or 0),
+        "total": int(entry.get("total") or 0),
+        "latency_ms": round(lat, 3),
+        "tokens_total": int(tok),
+        "open_model_rate": round(open_rate, 6),
+        "what": str(entry.get("what") or "")[:200],
+        "touched": [str(p) for p in (entry.get("touched") or [])],
+        "optimizer_model": str(entry.get("optimizer_model") or ""),
+        "ts": float(entry.get("ts") or time.time()),
+    }
+
+
+def load_pareto_archive(path: Optional[Path] = None) -> dict:
+    """Load the persisted Pareto archive, returning an empty structure if absent or corrupt."""
+    target = resolve_pareto_path(path)
+    if not target.is_file():
+        return {"schema_version": "1.0", "elites": []}
+    try:
+        data = json.loads(target.read_text(encoding="utf-8", errors="replace"))
+    except (OSError, json.JSONDecodeError, ValueError):
+        return {"schema_version": "1.0", "elites": []}
+    if not isinstance(data, dict) or not isinstance(data.get("elites"), list):
+        return {"schema_version": "1.0", "elites": []}
+    return {
+        "schema_version": str(data.get("schema_version") or "1.0"),
+        "elites": [dict(e) for e in data["elites"] if isinstance(e, dict)],
+    }
+
+
+def _merge_pareto_elites(
+    existing: list[dict],
+    incoming: list[dict],
+    *,
+    benchmark: str,
+    max_elites: int,
+) -> tuple[list[dict], list[dict]]:
+    other_elites = [e for e in existing if e.get("benchmark") != benchmark]
+    same_elites = [e for e in existing if e.get("benchmark") == benchmark]
+
+    dedup: dict[tuple, dict] = {}
+    for entry in same_elites + incoming:
+        key = (
+            str(entry.get("benchmark") or ""),
+            int(entry.get("round") or 0),
+            str(entry.get("sample") or ""),
+            float(entry.get("score") or 0.0),
+            float(entry.get("open_model_rate") or 0.0),
+            float(entry.get("latency_ms") or 0.0),
+            int(entry.get("tokens_total") or 0),
+        )
+        dedup[key] = entry
+    pool = list(dedup.values())
+
+    merged: list[dict] = compute_pareto_front(pool)
+    seen_keys = {
+        (e.get("round"), e.get("sample"), e.get("score"), e.get("open_model_rate"), e.get("latency_ms"), e.get("tokens_total"))
+        for e in merged
+    }
+    if pool:
+        niche_picks = [
+            max(pool, key=lambda e: (float(e.get("score") or 0.0), -float(e.get("latency_ms") or 0.0))),
+            max(pool, key=lambda e: (float(e.get("open_model_rate") or 0.0), float(e.get("score") or 0.0))),
+        ]
+        with_lat = [e for e in pool if float(e.get("latency_ms") or 0.0) > 0]
+        if with_lat:
+            niche_picks.append(min(with_lat, key=lambda e: (float(e.get("latency_ms") or 0.0), -float(e.get("score") or 0.0))))
+        with_tok = [e for e in pool if int(e.get("tokens_total") or 0) > 0]
+        if with_tok:
+            niche_picks.append(min(with_tok, key=lambda e: (int(e.get("tokens_total") or 0), -float(e.get("score") or 0.0))))
+        for pick in niche_picks:
+            nkey = (
+                pick.get("round"),
+                pick.get("sample"),
+                pick.get("score"),
+                pick.get("open_model_rate"),
+                pick.get("latency_ms"),
+                pick.get("tokens_total"),
+            )
+            if nkey not in seen_keys:
+                seen_keys.add(nkey)
+                merged.append(pick)
+
+    cap = max(1, int(max_elites))
+    return other_elites, merged[:cap]
+
+
+def update_pareto_archive(
+    candidates: list[dict],
+    *,
+    round_num: int,
+    benchmark: str,
+    objective: str,
+    path: Optional[Path] = None,
+    max_elites: int = 12,
+    save: bool = True,
+) -> list[dict]:
+    """Merge incoming candidates into the Pareto + MAP-Elites niche archive."""
+    incoming = [
+        _compact_pareto_entry(c, round_num=round_num, benchmark=benchmark, objective=objective)
+        for c in compute_pareto_front(candidates)
+    ]
+    if not save:
+        archive = load_pareto_archive(path)
+        _, merged = _merge_pareto_elites(
+            list(archive.get("elites") or []),
+            incoming,
+            benchmark=benchmark,
+            max_elites=max_elites,
+        )
+        return merged
+
+    try:
+        import fcntl
+    except ImportError:  # pragma: no cover - non-POSIX fallback
+        fcntl = None  # type: ignore[assignment]
+
+    target = resolve_pareto_path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = target.with_suffix(target.suffix + ".lock")
+    with open(lock_path, "a+", encoding="utf-8") as lock_file:
+        if fcntl is not None:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            archive = load_pareto_archive(target)
+            other_elites, merged = _merge_pareto_elites(
+                list(archive.get("elites") or []),
+                incoming,
+                benchmark=benchmark,
+                max_elites=max_elites,
+            )
+            payload = {
+                "schema_version": "1.0",
+                "elites": other_elites + merged,
+            }
+            fd, tmp_name = tempfile.mkstemp(prefix=".pareto-", suffix=".tmp", dir=str(target.parent))
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                    json.dump(payload, handle, indent=2, ensure_ascii=False)
+                    handle.write("\n")
+                os.replace(tmp_name, target)
+            except BaseException:
+                if os.path.exists(tmp_name):
+                    os.unlink(tmp_name)
+                raise
+            return merged
+        finally:
+            if fcntl is not None:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def collect_trajectory_feedback(
+    events_path: Optional[Path] = None,
+    errata_path: Optional[Path] = None,
+    *,
+    max_items: int = 6,
+) -> list[dict]:
+    """Collect sanitized GEPA feedback from errata and failing/slow non-dry-run spans."""
+    from nexus.errata import read_errata
+    from nexus.events import read_events
+
+    cap = max(0, int(max_items))
+    if cap == 0:
+        return []
+
+    try:
+        errata_items = read_errata(path=errata_path, limit=50)
+    except (OSError, ValueError):
+        errata_items = []
+    try:
+        events = (
+            read_events(path=events_path, limit=400)
+            if events_path is not None
+            else read_events(limit=400)
+        )
+    except (OSError, ValueError):
+        events = []
+
+    dry_traces = {
+        str(ev.get("trace_id") or "")
+        for ev in events
+        if ev.get("dry_run") is True or ev.get("step") == "dry-run complete"
+    }
+
+    def _sanitized_erratum(err: dict, source: str) -> dict:
+        return {
+            "source": source,
+            "route": str(err.get("route") or ""),
+            "model": str(err.get("model") or ""),
+            "status": "FALSE_PASS" if err.get("false_pass") else str(err.get("severity") or "normal").upper(),
+            "elapsed_ms": 0,
+            "tokens_in": 0,
+            "tokens_out": 0,
+            "detail": str(err.get("note") or err.get("kind") or source)[:160],
+        }
+
+    false_pass_items: list[dict] = []
+    other_errata_items: list[dict] = []
+    for err in reversed(errata_items):
+        if not isinstance(err, dict):
+            continue
+        if str(err.get("trace_id") or "") in dry_traces:
+            continue
+        if err.get("false_pass"):
+            false_pass_items.append(_sanitized_erratum(err, "erratum:false_pass"))
+        else:
+            kind = str(err.get("kind") or "complaint")
+            other_errata_items.append(_sanitized_erratum(err, f"erratum:{kind}"))
+
+    fail_spans: list[dict] = []
+    slow_spans: list[dict] = []
+    for ev in reversed(events):
+        if not isinstance(ev, dict):
+            continue
+        if ev.get("dry_run") is True or ev.get("step") == "dry-run complete":
+            continue
+        if str(ev.get("quota_tier") or "").upper() == "ORCHESTRATOR":
+            continue
+        status = str(ev.get("status") or "").upper()
+        elapsed_ms = int(ev.get("elapsed_ms") or 0)
+        base = {
+            "route": str(ev.get("route") or ""),
+            "model": str(ev.get("model") or ""),
+            "status": status,
+            "elapsed_ms": elapsed_ms,
+            "tokens_in": int(ev.get("tokens_in") or 0),
+            "tokens_out": int(ev.get("tokens_out") or 0),
+        }
+        if status in ("FAIL", "TIMEOUT"):
+            fail_spans.append(
+                {
+                    **base,
+                    "source": f"span:{status}",
+                    "detail": str(ev.get("error") or ev.get("step") or status)[:160],
+                }
+            )
+        elif status == "DONE" and elapsed_ms >= 30000:
+            slow_spans.append(
+                {
+                    **base,
+                    "source": "span:slow",
+                    "detail": f"slow elapsed_ms={elapsed_ms}",
+                }
+            )
+
+    combined = false_pass_items + other_errata_items + fail_spans + slow_spans
+    return combined[:cap]
+
+
+def resolve_explorer_routes(
+    routes_data: Optional[dict] = None,
+    *,
+    fallback_route: str = "refactor",
+) -> list[str]:
+    """Return configured $0/local explorer routes in priority order for multi-sample exploration."""
+    data = routes_data if isinstance(routes_data, dict) else load_routes()
+    routes = data.get("routes") if isinstance(data.get("routes"), dict) else {}
+    picked: list[str] = []
+    for name in ("omni", "fast-code", "code", "free-reason"):
+        cfg = routes.get(name)
+        if not isinstance(cfg, dict):
+            continue
+        tier = str(cfg.get("quota_tier") or "").strip().upper()
+        if tier in {"FREE", "LOCAL"}:
+            picked.append(name)
+    return picked or [fallback_route]
+
+
+# ---------------------------------------------------------------------------
 # Prompts
 
 
@@ -892,6 +1297,8 @@ def build_proposer_prompt(
     objective: str = "balanced",
     policy: Optional[ScopePolicy] = None,
     spec: Optional[BenchmarkSpec] = None,
+    trajectory_feedback: Optional[list[dict]] = None,
+    pareto_elites: Optional[list[dict]] = None,
 ) -> str:
     """Build the Proposer prompt; only the evolve split may ever reach it."""
     if baseline.split != "evolve":
@@ -958,6 +1365,16 @@ def build_proposer_prompt(
             "native/ rewrites where editable (avoid unnecessary no-op churn)."
         )
     lines.append("")
+    if trajectory_feedback:
+        lines.append("## Live trajectory feedback (GEPA signals)")
+        for item in trajectory_feedback:
+            lines.append("- " + json.dumps(item, ensure_ascii=False))
+        lines.append("")
+    if pareto_elites:
+        lines.append("## Pareto archive elites")
+        for elite in pareto_elites:
+            lines.append("- " + json.dumps(elite, ensure_ascii=False))
+        lines.append("")
     lines.append("## Complete SIM LEDGER (injected without truncation)")
     lines.append(sim.format_sim_for_prompt(ledger))
     lines.append("")
@@ -998,6 +1415,7 @@ def build_selector_prompt(
     round_num: int,
     policy_models: list[str],
     objective: str = "balanced",
+    pareto_front: Optional[list[dict]] = None,
 ) -> str:
     """Build the Selector prompt; only the evolve split may ever reach it."""
     if baseline.split != "evolve":
@@ -1066,6 +1484,9 @@ def build_selector_prompt(
         "- Prefer the highest score; at equal accuracy, prefer measurable gains on "
         f"objective '{obj}' (faster latency_ms, lower tokens_total, higher open_model_rate)."
     )
+    if pareto_front:
+        samples = ", ".join(str(item.get("sample") or "-") for item in pareto_front)
+        lines.append(f"- Pareto non-dominated samples: {samples}")
     return "\n".join(lines)
 
 
@@ -1169,6 +1590,19 @@ def _seed_sandbox(
             shutil.copy2(src, dst)
 
 
+def _assert_sandbox_edit_integrity(norm_edits: list[dict], spec: BenchmarkSpec) -> None:
+    """Reject candidate edits that reference held-out tasks or probe verifier lock boundaries."""
+    for edit in norm_edits:
+        for field_name in ("content", "replace"):
+            raw = edit.get(field_name)
+            if not isinstance(raw, str) or not raw:
+                continue
+            if scan_held_out_leaks(raw, spec):
+                raise PermissionError("integrity guard: edit references held-out tasks")
+            if "IMMUTABLE_LOCKED_FILES" in raw or "held_out_tasks" in raw:
+                raise PermissionError("integrity guard: edit attempts verifier or locked-boundary bypass")
+
+
 def apply_edits_in_sandbox(
     workspace: Path,
     spec: BenchmarkSpec,
@@ -1201,6 +1635,7 @@ def apply_edits_in_sandbox(
         if any(tag in first for tag in ("is empty", "must be relative", "must not traverse")):
             raise ValueError(first)
         raise PermissionError(first)
+    _assert_sandbox_edit_integrity(norm_edits, spec)
 
     tempdir = tempfile.TemporaryDirectory(prefix="nexus-evolve-sandbox-")
     sandbox_root = Path(tempdir.name)
@@ -1297,13 +1732,26 @@ def _execute_route_span(
     intent_label: str,
 ):
     """Dispatch one optimizer span through the configured backend, or fail softly."""
-    try:
-        routes_data = load_routes(Path(workspace) / "config" / "routes.json")
-    except (OSError, ValueError) as exc:
-        return None, f"route table unavailable: {exc}"
-    cfg = (routes_data.get("routes") or {}).get(route_key)
+    cfg = None
+    ws_routes = Path(workspace) / "config" / "routes.json"
+    if ws_routes.is_file():
+        try:
+            routes_data = load_routes(ws_routes)
+            candidate_cfg = (routes_data.get("routes") or {}).get(route_key)
+            if isinstance(candidate_cfg, dict) and candidate_cfg:
+                cfg = candidate_cfg
+        except (OSError, ValueError):
+            cfg = None
     if not isinstance(cfg, dict) or not cfg:
-        return None, f"route '{route_key}' missing from the workspace route table"
+        try:
+            user_data = load_routes()
+            candidate_cfg = (user_data.get("routes") or {}).get(route_key)
+            if isinstance(candidate_cfg, dict) and candidate_cfg:
+                cfg = candidate_cfg
+        except (OSError, ValueError) as exc:
+            return None, f"route table unavailable: {exc}"
+    if not isinstance(cfg, dict) or not cfg:
+        return None, f"route '{route_key}' missing from workspace and user route tables"
     span_cfg = dict(cfg)
     span_cfg["intent"] = intent_label
     span_cfg["quota_tier"] = "ORCHESTRATOR"
@@ -1471,8 +1919,7 @@ def _run_sandbox_build(
     cmd = [str(part) for part in build_cmd if str(part)]
     if not cmd:
         return True, ""
-    env = dict(os.environ)
-    env["NEXUS_EVAL_WORKSPACE"] = str(sandbox_root)
+    env = build_sandbox_env(sandbox_root)
     try:
         proc = subprocess.run(
             cmd,
@@ -1617,6 +2064,9 @@ def _run_candidate(
     sandboxes: dict,
     objective: str = "balanced",
     repeats: int = 1,
+    sandboxes_lock: Optional[threading.Lock] = None,
+    trajectory_feedback: Optional[list[dict]] = None,
+    pareto_elites: Optional[list[dict]] = None,
 ) -> dict:
     """Obtain, verify and score one candidate proposal."""
     sample_id = f"r{round_num}s{sample}"
@@ -1648,6 +2098,7 @@ def _run_candidate(
         "accepted": False,
         "recorded": False,
         "optimizer_model": "",
+        "proposer_route": proposer_route,
         "policy_models": list(baseline.policy_models),
     }
 
@@ -1661,6 +2112,8 @@ def _run_candidate(
         objective=objective,
         policy=policy,
         spec=spec,
+        trajectory_feedback=trajectory_feedback,
+        pareto_elites=pareto_elites,
     )
     # Held-out firewall: no model-facing string may carry held-out data.
     _assert_no_held_out_leak(proposer_prompt, spec)
@@ -1770,7 +2223,11 @@ def _run_candidate(
             candidate["failure_class"] = "scope_violation"
             candidate["error"] = f"edits rejected: {type(exc).__name__}: {exc}"
         else:
-            sandboxes[sample_id] = (sandbox_root, tempdir)
+            if sandboxes_lock is not None:
+                with sandboxes_lock:
+                    sandboxes[sample_id] = (sandbox_root, tempdir)
+            else:
+                sandboxes[sample_id] = (sandbox_root, tempdir)
             candidate["touched"] = touched
             candidate["scope_ok"] = True
             effective_build = policy.build_cmd or tuple(spec.build_cmd or ())
@@ -1867,6 +2324,10 @@ def run_evolve_round(
     allow_fallback: bool = True,
     objective: str = "balanced",
     repeats: int = 1,
+    explorer_routes: Optional[list[str]] = None,
+    parallel_candidates: bool = False,
+    pareto_path: Optional[Path] = None,
+    errata_path: Optional[Path] = None,
 ) -> dict:
     """Run one propose/verify/select round and return a summary dict.
 
@@ -1883,6 +2344,28 @@ def run_evolve_round(
             extra_editable=list(spec.editable_files),
             extra_locked=list(spec.locked_files),
         )
+    if explorer_routes:
+        active_explorers = [str(r).strip() for r in explorer_routes if str(r).strip()]
+    elif str(proposer_route or "").strip().lower() == "auto":
+        routes_file = workspace / "config" / "routes.json"
+        merged_routes: dict = {}
+        if routes_file.is_file():
+            try:
+                merged_routes.update(load_routes(routes_file).get("routes") or {})
+            except (OSError, ValueError):
+                pass
+        try:
+            merged_routes.update(load_routes().get("routes") or {})
+        except (OSError, ValueError):
+            pass
+        active_explorers = resolve_explorer_routes(
+            {"routes": merged_routes}, fallback_route="refactor"
+        )
+    else:
+        active_explorers = [str(proposer_route or "refactor")]
+    if not active_explorers:
+        active_explorers = [str(proposer_route or "refactor")]
+
     trace_id = parent_trace_id or new_trace_id()
     round_span = new_span_id()
     started = time.monotonic()
@@ -1903,6 +2386,7 @@ def run_evolve_round(
     )
 
     sandboxes: dict = {}
+    sandboxes_lock = threading.Lock()
     try:
         baseline = evaluate_split(
             workspace, spec, split="evolve", policy_routes=policy_routes, repeats=repeats
@@ -1910,31 +2394,56 @@ def run_evolve_round(
         policy_models = list(baseline.policy_models)
         editable_contents = _read_editable_contents(workspace, policy)
 
-        candidates: list[dict] = []
-        for sample in range(1, max(0, int(candidates_k)) + 1):
-            candidates.append(
-                _run_candidate(
-                    workspace=workspace,
-                    spec=spec,
-                    ledger=ledger,
-                    policy=policy,
-                    baseline=baseline,
-                    editable_contents=editable_contents,
-                    sample=sample,
-                    round_num=round_num,
-                    trace_id=trace_id,
-                    round_span=round_span,
-                    policy_routes=policy_routes,
-                    proposer_route=proposer_route,
-                    dry_run=dry_run,
-                    optimizer_fn=optimizer_fn,
-                    events_path=events_path,
-                    allow_fallback=allow_fallback,
-                    sandboxes=sandboxes,
-                    objective=obj,
-                    repeats=repeats,
-                )
+        raw_feedback = collect_trajectory_feedback(
+            events_path=events_path, errata_path=errata_path
+        )
+        trajectory_feedback = [
+            item
+            for item in raw_feedback
+            if not scan_held_out_leaks(json.dumps(item, ensure_ascii=False), spec)
+        ]
+        pareto_archive = load_pareto_archive(pareto_path)
+        pareto_elites = [
+            entry
+            for entry in (pareto_archive.get("elites") or [])
+            if isinstance(entry, dict)
+            and entry.get("benchmark") == spec.name
+            and not scan_held_out_leaks(json.dumps(entry, ensure_ascii=False), spec)
+        ][:6]
+
+        def _launch(sample_idx: int) -> dict:
+            sample_route = active_explorers[(sample_idx - 1) % len(active_explorers)]
+            return _run_candidate(
+                workspace=workspace,
+                spec=spec,
+                ledger=ledger,
+                policy=policy,
+                baseline=baseline,
+                editable_contents=editable_contents,
+                sample=sample_idx,
+                round_num=round_num,
+                trace_id=trace_id,
+                round_span=round_span,
+                policy_routes=policy_routes,
+                proposer_route=sample_route,
+                dry_run=dry_run,
+                optimizer_fn=optimizer_fn,
+                events_path=events_path,
+                allow_fallback=allow_fallback,
+                sandboxes=sandboxes,
+                objective=obj,
+                repeats=repeats,
+                sandboxes_lock=sandboxes_lock,
+                trajectory_feedback=trajectory_feedback,
+                pareto_elites=pareto_elites,
             )
+
+        sample_count = max(0, int(candidates_k))
+        if parallel_candidates and sample_count > 1 and not dry_run and optimizer_fn is None:
+            with ThreadPoolExecutor(max_workers=min(4, sample_count)) as executor:
+                candidates = list(executor.map(_launch, range(1, sample_count + 1)))
+        else:
+            candidates = [_launch(sample_idx) for sample_idx in range(1, sample_count + 1)]
 
         # --- selection ----------------------------------------------------
         valid = [
@@ -1942,6 +2451,7 @@ def run_evolve_round(
             for cand in candidates
             if cand["scope_ok"] and not cand["error"] and not cand["regressed"]
         ]
+        round_pareto = compute_pareto_front(valid)
         winner: Optional[dict] = None
         selection_mode = "none"
         if len(valid) == 1:
@@ -1959,6 +2469,7 @@ def run_evolve_round(
                     round_num=round_num,
                     policy_models=policy_models,
                     objective=obj,
+                    pareto_front=round_pareto,
                 )
                 # Held-out firewall applies to the Selector prompt as well.
                 _assert_no_held_out_leak(selector_prompt, spec)
@@ -2023,6 +2534,15 @@ def run_evolve_round(
             candidate["accepted"] = bool(accepted)
             candidate["recorded"] = True
 
+        update_pareto_archive(
+            valid,
+            round_num=round_num,
+            benchmark=spec.name,
+            objective=obj,
+            path=pareto_path,
+            save=(not dry_run or pareto_path is not None),
+        )
+
         # --- apply ----------------------------------------------------------
         applied = False
         if promoted and apply_changes and not dry_run and winner is not None:
@@ -2076,6 +2596,11 @@ def run_evolve_round(
             "promoted": bool(promoted),
             "applied": bool(applied),
             "selection_mode": selection_mode,
+            "pareto_front": [
+                _compact_pareto_entry(cand, round_num=round_num, benchmark=spec.name, objective=obj)
+                for cand in round_pareto
+            ],
+            "explorer_routes": active_explorers,
         }
 
         emit_event(
@@ -2158,6 +2683,10 @@ def run_evolve_loop(
     allow_fallback: bool = True,
     objective: str = "balanced",
     repeats: int = 1,
+    explorer_routes: Optional[list[str]] = None,
+    parallel_candidates: bool = False,
+    pareto_path: Optional[Path] = None,
+    errata_path: Optional[Path] = None,
 ) -> dict:
     """Run ``rounds`` consecutive evolve rounds, saving the ledger each round.
 
@@ -2198,6 +2727,10 @@ def run_evolve_loop(
             allow_fallback=allow_fallback,
             objective=obj,
             repeats=repeats,
+            explorer_routes=explorer_routes,
+            parallel_candidates=parallel_candidates,
+            pareto_path=pareto_path,
+            errata_path=errata_path,
         )
         summaries.append(summary)
         if sim_path is not None:

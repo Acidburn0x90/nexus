@@ -840,6 +840,8 @@ def cmd_evolve(args: argparse.Namespace) -> int:
             events_path=events_path,
             allow_fallback=not bool(getattr(args, "no_fallback", False)),
             objective=objective,
+            explorer_routes=getattr(args, "explorer_routes", None),
+            parallel_candidates=bool(getattr(args, "parallel", False)),
         )
     except (OSError, ValueError) as exc:
         if getattr(args, "envelope", False):
@@ -864,6 +866,11 @@ def cmd_evolve(args: argparse.Namespace) -> int:
                 "rounds_run": result.get("rounds_run"),
                 "promoted_rounds": result.get("promoted_rounds") or [],
                 "applied_rounds": result.get("applied_rounds") or [],
+                "pareto_front_sizes": [
+                    len(r.get("pareto_front") or [])
+                    for r in (result.get("round_summaries") or [])
+                    if isinstance(r, dict)
+                ],
                 "sim_saved": save_target is not None,
             },
         )
@@ -893,7 +900,8 @@ def cmd_evolve(args: argparse.Namespace) -> int:
             f"baseline={int(baseline.get('passed') or 0)}/{int(baseline.get('total') or 0)} ({base_score:.1%}) "
             f"-> final={final_text} · winner={winner_id} "
             f"· promoted={'yes' if summary.get('promoted') else 'no'} "
-            f"· applied={'yes' if summary.get('applied') else 'no'}"
+            f"· applied={'yes' if summary.get('applied') else 'no'} "
+            f"· pareto={len(summary.get('pareto_front') or [])}"
         )
 
     promoted = result.get("promoted_rounds") or []
@@ -2562,6 +2570,19 @@ def _add_evolve_flags(subparser: argparse.ArgumentParser, *, suppress_existing: 
     )
     subparser.add_argument(
         "--selector-route", default=default("reason"), help="Specialist route that selects a candidate (default: reason)"
+    )
+    subparser.add_argument(
+        "--explorer-route",
+        dest="explorer_routes",
+        action="append",
+        default=default(None),
+        help="Free/fast explorer route(s) for parallel candidate sampling (repeatable)",
+    )
+    subparser.add_argument(
+        "--parallel",
+        action="store_true",
+        default=default(False),
+        help="Run candidate proposals concurrently via ThreadPoolExecutor",
     )
     subparser.add_argument(
         "--policy-route", dest="policy_routes", action="append", default=default(None),

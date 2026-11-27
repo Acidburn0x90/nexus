@@ -151,6 +151,24 @@ def _read_tail(target: Path, window: int) -> tuple[list[dict], bool]:
     return _parse_event_lines(lines, None), start == 0
 
 
+def _native_tail_offset(target: Path, keep_lines: int) -> Optional[int]:
+    """Ask the optional native library where the last `keep_lines` start.
+
+    Returns None for every "no native answer" case: module absent, library
+    missing or disabled, unreadable file. The caller then runs its own
+    tail-seek, so the accelerator can never change behaviour.
+    """
+    try:
+        from nexus.native_bridge import find_tail_offset_fast
+
+        offset = find_tail_offset_fast(target, keep_lines)
+    except Exception:  # optional accelerator: any failure means "use Python"
+        return None
+    if offset is None or offset < 0:
+        return None
+    return int(offset)
+
+
 def read_events(
     path: Optional[Path] = None,
     trace_id: Optional[str] = None,
@@ -170,6 +188,23 @@ def read_events(
             return matched
 
     if limit is not None and limit > 0 and trace_id is None:
+        # Native tail-seek first: one backward scan in C99 instead of Python
+        # windows. A malformed or blank trailing run that yields fewer than
+        # `limit` records falls through to the windowed loop below.
+        offset = _native_tail_offset(target, limit)
+        if offset is not None:
+            try:
+                with open(target, "rb") as handle:
+                    handle.seek(offset)
+                    native_bytes = handle.read()
+            except OSError:
+                native_bytes = None
+            if native_bytes is not None:
+                native_lines = native_bytes.decode("utf-8", errors="replace").splitlines()
+                native_events = _parse_event_lines(native_lines, None)
+                if len(native_events) >= limit or offset == 0:
+                    return native_events[-limit:]
+
         # Tail-seek: read backwards in growing windows so a multi-MB bus is
         # never read or parsed from byte 0 just to fetch the newest lines.
         try:

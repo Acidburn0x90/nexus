@@ -1360,3 +1360,24 @@ def test_bounded_history_clears_old_tool_output_keeping_recent_verbatim() -> Non
     assert "[cleared old tool output" in kept[1]["content"]
     assert kept[-1]["content"].startswith("recent-5 ")
     assert len(kept[-1]["content"]) > 240
+
+
+def test_bounded_history_deduplicates_repeated_older_blocks_keeping_recent_verbatim() -> None:
+    repeated_block = "\n".join(
+        [
+            "diff --git a/nexus/router.py b/nexus/router.py",
+            "--- a/nexus/router.py",
+            "+++ b/nexus/router.py",
+            "+   latency_budget_ms = 50.0  # repeated diagnostic snippet line for dedup check",
+        ]
+    )
+    history = [
+        {"role": "user", "content": "older turn 0"},
+        {"role": "assistant", "content": "Check 1:\n\n" + repeated_block},
+    ]
+    for i in range(6):
+        content = f"recent-{i}" if i < 5 else "Latest view:\n\n" + repeated_block
+        history.append({"role": "user" if i % 2 == 0 else "assistant", "content": content})
+    kept = backends._bounded_history(history)
+    assert "[dedup: repeated 4-line block" in kept[1]["content"]
+    assert repeated_block in kept[-1]["content"]

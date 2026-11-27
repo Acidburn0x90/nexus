@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 from dataclasses import dataclass
+import hashlib
 import itertools
 import json
 import os
@@ -414,6 +415,8 @@ _HTTP_STATUS_RE = re.compile(r"\b(?:HTTP(?:\s+Error)?\s+)?(40[0-9]|429|50[0-9]|5
 _HISTORY_KEEP_RECENT_TURNS = 3
 _HISTORY_TOOL_CLEAR_CHARS = 240
 _TOOL_OUTPUT_MARKERS = ("[Tool", "[Attached file:", "Command output:", "Tool output:", "stdout:", "stderr:")
+_DEDUP_MIN_BLOCK_CHARS = 120
+_DEDUP_MIN_BLOCK_LINES = 3
 
 
 def classify_http_error(error_or_status: object) -> str:
@@ -559,6 +562,40 @@ def _clear_old_tool_output(content: str) -> str:
     return content
 
 
+def _dedup_repeated_blocks(messages: list[dict], *, tail_cutoff: int) -> list[dict]:
+    """Deduplicate repeated multi-line blocks in older turns while keeping the newest copy verbatim."""
+    seen: set[str] = set()
+    out: list[Optional[dict]] = [None] * len(messages)
+    for idx in range(len(messages) - 1, -1, -1):
+        msg = messages[idx]
+        content = msg["content"]
+        sep = "\r\n\r\n" if "\r\n\r\n" in content and "\n\n" not in content else "\n\n"
+        blocks = content.split(sep)
+        rewritten: list[str] = []
+        changed = False
+        for block in blocks:
+            stripped = block.strip()
+            norm_lines = [line.rstrip() for line in stripped.splitlines()]
+            if len(stripped) >= _DEDUP_MIN_BLOCK_CHARS and len(norm_lines) >= _DEDUP_MIN_BLOCK_LINES:
+                digest = hashlib.sha256("\n".join(norm_lines).encode("utf-8")).hexdigest()
+                if idx >= tail_cutoff:
+                    seen.add(digest)
+                    rewritten.append(block)
+                elif digest in seen:
+                    rewritten.append(f"[dedup: repeated {len(norm_lines)}-line block ({len(block)} chars)]")
+                    changed = True
+                else:
+                    seen.add(digest)
+                    rewritten.append(block)
+            else:
+                rewritten.append(block)
+        if changed and idx < tail_cutoff:
+            out[idx] = {"role": msg["role"], "content": sep.join(rewritten)}
+        else:
+            out[idx] = {"role": msg["role"], "content": content}
+    return [item for item in out if item is not None]
+
+
 def _bounded_history(history_messages: Optional[list[dict]]) -> list[dict]:
     """Keep the newest 12 user/assistant turns within 16k chars, clearing old tool outputs (>240 chars)."""
     valid: list[dict] = []
@@ -577,6 +614,7 @@ def _bounded_history(history_messages: Optional[list[dict]]) -> list[dict]:
     for idx, msg in enumerate(valid):
         content = msg["content"] if idx >= tail_cutoff else _clear_old_tool_output(msg["content"])
         normalized.append({"role": msg["role"], "content": content})
+    normalized = _dedup_repeated_blocks(normalized, tail_cutoff=tail_cutoff)
 
     kept: list[dict] = []
     total = 0

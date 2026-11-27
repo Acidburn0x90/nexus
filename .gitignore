@@ -34,6 +34,10 @@ events.jsonl
 # Knowledge Graph
 graphify-out/
 
+# Native C builds
+native/*.so
+native/*.o
+
 # Local Reference PDFs
 # Large local research material; never commit or push these.
 Cross-Model SIM Data Distillation.pdf

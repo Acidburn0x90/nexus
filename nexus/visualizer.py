@@ -42,8 +42,23 @@ _ANSI_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
 
 
 def strip_ansi(s: str) -> str:
-    """Strip ANSI escape sequences from a string."""
-    return _ANSI_RE.sub("", s)
+    """Strip ANSI escape sequences from a string.
+
+    Short single lines use the Python regex directly: a ctypes call costs more
+    than the substitution it saves. Bulk payloads (>= 512 chars) delegate to the
+    optional C99 hot path, which degrades to the same regex when the compiled
+    library is missing or disabled.
+    """
+    if "\x1b" not in s:
+        return s
+    if len(s) < 512:
+        return _ANSI_RE.sub("", s)
+    try:
+        from nexus.native_bridge import strip_ansi_fast
+    except ImportError:  # native_bridge.py absent: keep the pure-Python path
+        return _ANSI_RE.sub("", s)
+
+    return strip_ansi_fast(s)
 
 
 def visible_len(s: str) -> int:
