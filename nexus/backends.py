@@ -9,6 +9,8 @@ import json
 import os
 from pathlib import Path
 import queue
+import random
+import re
 import shutil
 import signal
 import socket
@@ -22,6 +24,7 @@ import urllib.request
 
 from nexus.drops import SEND_FILE_TOOL_SCHEMA, write_drop_file
 from nexus.events import DEFAULT_EVENTS_PATH, emit_event, new_span_id
+from nexus.router import load_routes, resolve_route_api_key
 from nexus.square import DEFAULT_BOARD_PATH, DEFAULT_SQUARE_PATH, format_square_context
 from nexus.visualizer import (
     format_duration,
@@ -271,6 +274,7 @@ class OpenCodeStream:
     last_step: str = "completed"
     session_id: str = ""
     thinking: str = ""
+    has_text: bool = False
 
 
 @dataclass
@@ -404,6 +408,120 @@ def _infer_fallback_tier(fallback_model: str, default_tier: str) -> str:
     return default_tier
 
 
+_HTTP_STATUS_RE = re.compile(r"\b(?:HTTP(?:\s+Error)?\s+)?(40[0-9]|429|50[0-9]|5[1-9][0-9])\b", re.IGNORECASE)
+_HISTORY_KEEP_RECENT_TURNS = 3
+_HISTORY_TOOL_CLEAR_CHARS = 240
+_TOOL_OUTPUT_MARKERS = ("[Tool", "[Attached file:", "Command output:", "Tool output:", "stdout:", "stderr:")
+
+
+def classify_http_error(error_or_status: object) -> str:
+    """Classify an HTTP status code or error message into auth|quota|transient|other."""
+    if isinstance(error_or_status, int):
+        code: Optional[int] = error_or_status
+        text = str(error_or_status)
+    else:
+        text = str(error_or_status or "").strip()
+        m = _HTTP_STATUS_RE.search(text)
+        code = int(m.group(1)) if m else None
+    low = text.lower()
+    if code in (401, 403) or any(tok in low for tok in ("unauthorized", "forbidden", "invalid api key", "authentication")):
+        return "auth"
+    if code in (402, 429) or any(tok in low for tok in ("rate limit", "too many requests", "quota", "insufficient credits")):
+        return "quota"
+    if code == 408 or (code is not None and code >= 500) or any(
+        tok in low for tok in ("timed out", "timeout", "connection refused", "connection reset", "urlopen error", "bad gateway", "service unavailable")
+    ):
+        return "transient"
+    return "other"
+
+
+class RouteHealthTracker:
+    """Thread-safe lazy 3-scope cooldown tracker with EWMA latency (alpha=0.3)."""
+
+    def __init__(self, alpha: float = 0.3) -> None:
+        self.alpha = float(alpha)
+        self._lock = threading.Lock()
+        self._cooldowns: dict[str, tuple[float, str]] = {}
+        self._failures: dict[str, int] = {}
+        self._ewma_ms: dict[str, float] = {}
+
+    @staticmethod
+    def _scopes(endpoint: str, route_key: str, model: str) -> tuple[str, str, str]:
+        return (
+            f"endpoint:{endpoint}",
+            f"route_key:{route_key}",
+            f"model:{endpoint}::{model}",
+        )
+
+    def _scope_for_kind(self, kind: str, endpoint: str, route_key: str, model: str) -> tuple[str, float, float]:
+        ep_s, rk_s, md_s = self._scopes(endpoint, route_key, model)
+        if kind == "transient":
+            return ep_s, 5.0, 60.0
+        if kind == "quota":
+            return rk_s, 15.0, 120.0
+        if kind == "auth":
+            return rk_s, 300.0, 300.0
+        return md_s, 10.0, 120.0
+
+    def record_failure(self, *, endpoint: str, route_key: str, model: str, kind: str) -> float:
+        """Apply capped jittered cooldown on the affected scope and return cooldown seconds."""
+        scope, base_s, cap_s = self._scope_for_kind(kind, endpoint, route_key, model)
+        with self._lock:
+            n = self._failures.get(scope, 0) + 1
+            self._failures[scope] = n
+            delay = min(cap_s, base_s * (2 ** min(n - 1, 5)))
+            jittered = delay * random.uniform(0.85, 1.15)
+            self._cooldowns[scope] = (time.monotonic() + jittered, kind)
+            return jittered
+
+    def record_success(self, *, endpoint: str, route_key: str, model: str, elapsed_ms: float) -> None:
+        """Clear scope cooldowns/failures and update EWMA latency."""
+        ep_s, rk_s, md_s = self._scopes(endpoint, route_key, model)
+        sample = max(0.0, float(elapsed_ms))
+        with self._lock:
+            for scope in (ep_s, rk_s, md_s):
+                self._failures.pop(scope, None)
+                self._cooldowns.pop(scope, None)
+            for scope in (rk_s, md_s):
+                prev = self._ewma_ms.get(scope)
+                self._ewma_ms[scope] = sample if prev is None else (self.alpha * sample + (1.0 - self.alpha) * prev)
+
+    def is_cooled_down(self, *, endpoint: str, route_key: str, model: str) -> Optional[str]:
+        """Return the active cooldown reason if any scope is cooling down, pruning expired entries."""
+        now = time.monotonic()
+        with self._lock:
+            for scope in self._scopes(endpoint, route_key, model):
+                entry = self._cooldowns.get(scope)
+                if entry is None:
+                    continue
+                until, reason = entry
+                if now < until:
+                    return f"{scope} ({reason})"
+                self._cooldowns.pop(scope, None)
+        return None
+
+    def latency_ewma(self, *, endpoint: str, route_key: str, model: str) -> Optional[float]:
+        """Return model-level or route-level EWMA latency in ms, if recorded."""
+        _, rk_s, md_s = self._scopes(endpoint, route_key, model)
+        with self._lock:
+            return self._ewma_ms.get(md_s, self._ewma_ms.get(rk_s))
+
+    def reset(self) -> None:
+        """Clear all recorded cooldowns, failures, and latency estimates."""
+        with self._lock:
+            self._cooldowns.clear()
+            self._failures.clear()
+            self._ewma_ms.clear()
+
+
+_HEALTH_TRACKER = RouteHealthTracker(alpha=0.3)
+
+
+def reset_health_state() -> None:
+    """Reset the shared RouteHealthTracker state (useful in tests and diagnostics)."""
+    _HEALTH_TRACKER.reset()
+
+
 def _markdown_piece(acc: str, chunk: str, saw_tool: bool) -> str:
     """Prefix a streamed chunk with a paragraph break when Markdown would glue."""
     if not acc or acc.endswith("\n\n"):
@@ -428,24 +546,47 @@ def _normalize_think(value: object) -> object:
     return None
 
 
+def _clear_old_tool_output(content: str) -> str:
+    """Deterministically replace bulky old tool outputs while preserving concise turns."""
+    if len(content) <= _HISTORY_TOOL_CLEAR_CHARS:
+        return content
+    stripped = content.lstrip()
+    if any(stripped.startswith(m) or f"\n{m}" in content for m in _TOOL_OUTPUT_MARKERS):
+        head = stripped.splitlines()[0][:120].strip()
+        return f"{head}\n[cleared old tool output ({len(content)} chars)]"
+    return content
+
+
 def _bounded_history(history_messages: Optional[list[dict]]) -> list[dict]:
-    """Keep the newest 12 user/assistant turns within a 16k-character budget."""
-    kept: list[dict] = []
-    total = 0
-    for msg in reversed(list(history_messages or [])):
-        if len(kept) >= _HISTORY_MAX_ITEMS:
-            break
+    """Keep the newest 12 user/assistant turns within 16k chars, clearing old tool outputs (>240 chars)."""
+    valid: list[dict] = []
+    for msg in list(history_messages or []):
         if not isinstance(msg, dict):
             continue
         role = msg.get("role")
         content = msg.get("content")
         if role not in ("user", "assistant") or not isinstance(content, str) or not content.strip():
             continue
+        valid.append({"role": role, "content": content})
+
+    # Keep the newest 3 conversation turns (up to 6 user/assistant messages) verbatim.
+    tail_cutoff = max(0, len(valid) - (_HISTORY_KEEP_RECENT_TURNS * 2))
+    normalized: list[dict] = []
+    for idx, msg in enumerate(valid):
+        content = msg["content"] if idx >= tail_cutoff else _clear_old_tool_output(msg["content"])
+        normalized.append({"role": msg["role"], "content": content})
+
+    kept: list[dict] = []
+    total = 0
+    for msg in reversed(normalized):
+        if len(kept) >= _HISTORY_MAX_ITEMS:
+            break
+        content = msg["content"]
         remaining = _HISTORY_MAX_CHARS - total
         if remaining <= 0:
             break
         content = content[-remaining:]
-        kept.append({"role": role, "content": content})
+        kept.append({"role": msg["role"], "content": content})
         total += len(content)
     kept.reverse()
     return kept
@@ -605,13 +746,15 @@ def _read_http_response(
     resp_box: list,
     errors: list[str],
     sink: "queue.Queue[Optional[str]]",
+    headers: Optional[dict[str, str]] = None,
 ) -> None:
     """POST a payload and push decoded response lines into `sink`; None terminates."""
     resp = None
     try:
-        req = urllib.request.Request(
-            endpoint, data=payload, headers={"Content-Type": "application/json"}, method="POST"
-        )
+        req_headers = {"Content-Type": "application/json"}
+        if headers:
+            req_headers.update(headers)
+        req = urllib.request.Request(endpoint, data=payload, headers=req_headers, method="POST")
         resp = urllib.request.urlopen(req, timeout=max(1.0, min(timeout_s, 30.0)))
         # Expose the raw socket so the caller can unblock a read without touching
         # the buffered response object (closing it would wait on the reader lock).
@@ -621,6 +764,19 @@ def _read_http_response(
             if closed.is_set():
                 break
             sink.put(line.decode("utf-8", errors="replace"))
+    except urllib.error.HTTPError as exc:
+        body = ""
+        try:
+            body = exc.read().decode("utf-8", errors="replace")[:2000]
+        except Exception:
+            pass
+        finally:
+            try:
+                exc.close()
+            except Exception:
+                pass
+        detail = _humanize_error(body, 220) if body else str(exc.reason or "")
+        errors.append(f"HTTP {exc.code}: {detail}" if detail else f"HTTP {exc.code}")
     except Exception as exc:  # urlopen/read errors are reported to the caller
         errors.append(str(exc))
     finally:
@@ -799,6 +955,7 @@ def _parse_opencode_json_stream(raw_stdout: str) -> "OpenCodeStream":
         last_step,
         discovered_session,
         "".join(thinking_chunks).strip(),
+        bool(text_chunks),
     )
 
 
@@ -841,6 +998,7 @@ def execute_route(
     system_persona: str = "",
     handoff_context: str = "",
     profile: str = "",
+    routes_path: Optional[Path] = None,
 ) -> ExecutionResult:
     """Execute a single delegated span against its configured harness backend."""
     span_id = span_id or new_span_id()
@@ -1087,8 +1245,8 @@ def execute_route(
     try:
         if backend == "opencode":
 
-            def _opencode_attempt(run_model: str, run_tier: str) -> ExecutionResult:
-                """Run one OpenCode attempt on the shared span, without a receipt."""
+            def _opencode_attempt(run_model: str, run_tier: str) -> tuple[ExecutionResult, bool]:
+                """Run one OpenCode attempt on the shared span, returning (result, streamed_text)."""
                 argv = ["opencode", "run", "--format", "json"]
                 if route_cfg.get("auto_approve") is not False:
                     argv.append("--auto")
@@ -1204,8 +1362,9 @@ def execute_route(
                         run_model=run_model,
                         run_tier=run_tier,
                         thinking=stream.thinking,
-                    )
+                    ), bool(acc_text.strip() or stream.has_text)
 
+                saw_text = bool(acc_text.strip() or stream.has_text)
                 if timed_out:
                     err_msg = f"Timed out after {timeout_s:.0f}s"
                     _emit(
@@ -1230,7 +1389,7 @@ def execute_route(
                     return ExecutionResult(
                         trace_id, span_id, route_key, backend, run_model, run_tier, "TIMEOUT", out_text,
                         tok_in, tok_out, elapsed_ms, err_msg, final_sid, thinking=stream.thinking,
-                    )
+                    ), saw_text
 
                 if rc != 0:
                     err_msg = _humanize_error(err_raw.strip() or out_raw.strip() or f"exit {rc}", 240)
@@ -1256,7 +1415,7 @@ def execute_route(
                     return ExecutionResult(
                         trace_id, span_id, route_key, backend, run_model, run_tier, "FAIL", out_text,
                         tok_in, tok_out, elapsed_ms, err_msg, final_sid, thinking=stream.thinking,
-                    )
+                    ), saw_text
 
                 step_label = f"{last_step} (ses:{final_sid[:12]})" if final_sid else last_step
                 _emit(
@@ -1280,13 +1439,15 @@ def execute_route(
                 return ExecutionResult(
                     trace_id, span_id, route_key, backend, run_model, run_tier, "DONE", out_text,
                     tok_in, tok_out, elapsed_ms, "", final_sid, tok_cached, thinking=stream.thinking,
-                )
+                ), saw_text
 
-            result = _opencode_attempt(model, quota_tier)
+            result, saw_opencode_text = _opencode_attempt(model, quota_tier)
             fb_model = route_cfg.get("fallback")
             if (
                 result.status == "FAIL"
                 and allow_fallback
+                and not saw_opencode_text
+                and classify_http_error(result.error) != "auth"
                 and isinstance(fb_model, str)
                 and fb_model.strip()
                 and fb_model.strip() != model
@@ -1318,291 +1479,390 @@ def execute_route(
                     )
                 think_printer.flush()
                 think_printer.reset_attempt()
-                result = _opencode_attempt(fb_model, fb_tier)
+                result, _ = _opencode_attempt(fb_model, fb_tier)
             return _finish(result)
 
         if backend in ("openai-compat", "colibri", "ollama"):
-            http_kind = "ollama" if backend == "ollama" else "openai-compat"
             if cancel_event is not None and cancel_event.is_set():
                 return _finish(_interrupted())
-            endpoint = route_cfg.get(
-                "endpoint",
-                "http://127.0.0.1:8000/v1/chat/completions" if http_kind == "openai-compat" else "http://127.0.0.1:11434/api/chat",
-            )
-            resolved_think = _normalize_think(think if think is not None else route_cfg.get("think"))
 
-            messages: list[dict] = []
-            sys_parts = [part for part in ((system_persona or "").strip(), sq_ctx.strip()) if part]
-            if sys_parts:
-                messages.append({"role": "system", "content": "\n\n".join(sys_parts)})
-            if history_messages:
-                messages.extend(_bounded_history(history_messages))
-            elif (handoff_context or "").strip():
-                messages.append({"role": "system", "content": handoff_context.strip()})
-            user_msg: dict = {"role": "user", "content": prompt}
-            if attach_file is not None:
-                try:
-                    prefix, image_b64 = _attachment_parts(attach_file, http_kind)
-                except OSError as exc:
-                    elapsed_ms = int((time.monotonic() - t0) * 1000)
-                    err_msg = str(exc)
+            def _http_endpoint(cfg: dict, kind: str) -> str:
+                return str(
+                    cfg.get(
+                        "endpoint",
+                        "http://127.0.0.1:8000/v1/chat/completions" if kind == "openai-compat" else "http://127.0.0.1:11434/api/chat",
+                    )
+                )
+
+            def _resolve_http_fallback(from_key: str, from_cfg: dict) -> Optional[tuple[str, dict]]:
+                fb_key = str(from_cfg.get("fallback_route") or "").strip()
+                if not fb_key or fb_key == from_key:
+                    return None
+                all_routes = load_routes(routes_path).get("routes", {})
+                fb_cfg = all_routes.get(fb_key)
+                if not isinstance(fb_cfg, dict):
+                    return None
+                if fb_cfg.get("backend") not in ("openai-compat", "colibri", "ollama"):
+                    return None
+                return fb_key, fb_cfg
+
+            def _http_attempt(attempt_route: str, attempt_cfg: dict) -> tuple[ExecutionResult, bool]:
+                a_backend = attempt_cfg.get("backend", backend)
+                a_kind = "ollama" if a_backend == "ollama" else "openai-compat"
+                a_model = str(attempt_cfg.get("model", model))
+                a_tier = str(attempt_cfg.get("quota_tier", quota_tier))
+                a_timeout_s = float(attempt_cfg.get("timeout_s", timeout_s))
+                a_endpoint = _http_endpoint(attempt_cfg, a_kind)
+                resolved_think = _normalize_think(think if think is not None else attempt_cfg.get("think"))
+                api_key = resolve_route_api_key(attempt_cfg)
+                req_headers = {"Authorization": f"Bearer {api_key}"} if api_key else None
+
+                messages: list[dict] = []
+                sys_parts = [part for part in ((system_persona or "").strip(), sq_ctx.strip()) if part]
+                if sys_parts:
+                    messages.append({"role": "system", "content": "\n\n".join(sys_parts)})
+                if history_messages:
+                    messages.extend(_bounded_history(history_messages))
+                elif (handoff_context or "").strip():
+                    messages.append({"role": "system", "content": handoff_context.strip()})
+                user_msg: dict = {"role": "user", "content": prompt}
+                if attach_file is not None:
+                    try:
+                        prefix, image_b64 = _attachment_parts(attach_file, a_kind)
+                    except OSError as exc:
+                        elapsed_ms = int((time.monotonic() - t0) * 1000)
+                        err_msg = str(exc)
+                        _emit(
+                            trace_id,
+                            span_id,
+                            parent_id=parent_id,
+                            route=attempt_route,
+                            intent=intent,
+                            backend=a_backend,
+                            model=a_model,
+                            quota_tier=a_tier,
+                            status="FAIL",
+                            step=err_msg,
+                            elapsed_ms=elapsed_ms,
+                            error=err_msg,
+                            profile=profile,
+                            events_path=events_path,
+                            on_event=on_event,
+                        )
+                        return ExecutionResult(
+                            trace_id, span_id, attempt_route, a_backend, a_model, a_tier, "FAIL", "", 0, 0, elapsed_ms, err_msg
+                        ), False
+                    if prefix:
+                        user_msg["content"] = prefix + prompt
+                    if image_b64:
+                        user_msg["images"] = [image_b64]
+                messages.append(user_msg)
+
+                out_chunks: list[str] = []
+                thinking_chunks: list[str] = []
+                tok_in = tok_out = 0
+                cancelled = timed_out = saw_first_byte = False
+                errors: list[str] = []
+                saw_tool_after_call = False
+                a_t0 = time.monotonic()
+                deadline = a_t0 + max(0.1, a_timeout_s)
+
+                for _round in range(4):
+                    if cancel_event is not None and cancel_event.is_set():
+                        cancelled = True
+                        break
+                    if deadline - time.monotonic() <= 0:
+                        timed_out = True
+                        break
+
+                    body: dict[str, Any] = {"model": a_model, "messages": messages, "stream": True}
+                    if a_kind == "ollama" and resolved_think is not None:
+                        body["think"] = resolved_think
+                    if attempt_cfg.get("tools") is not False:
+                        body["tools"] = [SEND_FILE_TOOL_SCHEMA]
+                    payload = json.dumps(body).encode("utf-8")
+
+                    round_chunks: list[str] = []
+                    ollama_calls: list[dict[str, Any]] = []
+                    openai_compat_slots: dict[int, dict[str, Any]] = {}
+                    round_in = round_out = 0
+                    resp_box: list = []
+                    closed = threading.Event()
+                    sink: "queue.Queue[Optional[str]]" = queue.Queue()
+                    reader_kwargs = {"headers": req_headers} if req_headers else {}
+                    reader = threading.Thread(
+                        target=_read_http_response,
+                        args=(a_endpoint, payload, a_timeout_s, closed, resp_box, errors, sink),
+                        kwargs=reader_kwargs,
+                        daemon=True,
+                    )
+                    reader.start()
+                    try:
+                        while True:
+                            if cancel_event is not None and cancel_event.is_set():
+                                cancelled = True
+                                break
+                            remaining = deadline - time.monotonic()
+                            if remaining <= 0:
+                                timed_out = True
+                                break
+                            try:
+                                line = sink.get(timeout=min(0.1, remaining))
+                            except queue.Empty:
+                                continue
+                            if line is None:
+                                break
+                            for obj in _stream_objects(line, a_kind):
+                                if a_kind == "ollama":
+                                    thinking, text = _ollama_stream_chunk(obj)
+                                    ollama_calls.extend(_ollama_tool_calls(obj))
+                                    if obj.get("done"):
+                                        round_in = int(obj.get("prompt_eval_count") or round_in)
+                                        round_out = int(obj.get("eval_count") or round_out)
+                                else:
+                                    thinking, text = _openai_compat_stream_chunk(obj)
+                                    _openai_compat_tool_delta(obj, openai_compat_slots)
+                                    usage = obj.get("usage") if isinstance(obj.get("usage"), dict) else {}
+                                    round_in = int(usage.get("prompt_tokens") or round_in)
+                                    round_out = int(usage.get("completion_tokens") or round_out)
+                                if thinking:
+                                    saw_first_byte = True
+                                    thinking_chunks.append(thinking)
+                                    think_printer.push(thinking)
+                                    if on_stream is not None:
+                                        on_stream("thinking", thinking)
+                                if text:
+                                    saw_first_byte = True
+                                    think_printer.flush()
+                                    piece = _markdown_piece("".join(out_chunks), text, True) if saw_tool_after_call else text
+                                    saw_tool_after_call = False
+                                    out_chunks.append(piece)
+                                    round_chunks.append(piece)
+                                    if on_stream is not None:
+                                        on_stream("text", piece)
+                    finally:
+                        closed.set()
+                        for sock in resp_box:
+                            if sock is None:
+                                continue
+                            try:
+                                sock.shutdown(socket.SHUT_RDWR)
+                            except OSError:
+                                pass
+                        reader.join(timeout=1.0)
+
+                    tok_in += round_in
+                    tok_out += round_out
+                    round_calls = ollama_calls if a_kind == "ollama" else _finalize_openai_compat_calls(openai_compat_slots)
+                    if round_calls:
+                        saw_first_byte = True
+                    if cancelled or timed_out or (errors and not round_calls) or not round_calls:
+                        break
+
+                    messages.append(
+                        {
+                            "role": "assistant",
+                            "content": "".join(round_chunks),
+                            "tool_calls": [
+                                {
+                                    "type": "function",
+                                    **({"id": tc["id"]} if tc.get("id") else {}),
+                                    "function": {
+                                        "name": tc["name"],
+                                        "arguments": tc["arguments"] if a_kind == "ollama" else tc["raw_args"],
+                                    },
+                                }
+                                for tc in round_calls
+                            ],
+                        }
+                    )
+                    for tc in round_calls:
+                        t_name = tc["name"] or "send_file"
+                        tool_res, summary = _run_drop_tool_call(tc, drop_dir=drop_dir)
+                        nonlocal tool_count
+                        tool_count += 1
+                        think_printer.flush()
+                        _emit(
+                            trace_id,
+                            span_id,
+                            parent_id=parent_id,
+                            route=attempt_route,
+                            intent=intent,
+                            backend=a_backend,
+                            model=a_model,
+                            quota_tier=a_tier,
+                            status="RUNNING",
+                            step=f"tool:{t_name}",
+                            elapsed_ms=int((time.monotonic() - t0) * 1000),
+                            profile=profile,
+                            events_path=events_path,
+                            on_event=on_event,
+                        )
+                        if on_stream is not None:
+                            on_stream("tool", summary)
+                        if emit_stderr and _status_enabled(verbosity):
+                            print(
+                                status_line("step", f"{_route_label(attempt_route)} · tool {tool_count}: {summary}", color=enabled),
+                                file=sys.stderr,
+                            )
+                        tool_msg: dict[str, Any] = {
+                            "role": "tool",
+                            "tool_name": t_name,
+                            "content": json.dumps(tool_res),
+                        }
+                        if tc.get("id"):
+                            tool_msg["tool_call_id"] = tc["id"]
+                        messages.append(tool_msg)
+                    saw_tool_after_call = True
+
+                elapsed_ms = int((time.monotonic() - t0) * 1000)
+                attempt_ms = (time.monotonic() - a_t0) * 1000.0
+                out_text = "".join(out_chunks).strip()
+                if not tok_in:
+                    tok_in = max(1, len(prompt) // 4)
+                if not tok_out and out_text:
+                    tok_out = max(1, len(out_text) // 4)
+
+                if cancelled:
+                    return (
+                        _interrupted(out_text, tok_in, tok_out, thinking="".join(thinking_chunks).strip()),
+                        saw_first_byte,
+                    )
+                if timed_out:
+                    err_msg = f"Timed out after {a_timeout_s:.0f}s"
+                    _HEALTH_TRACKER.record_failure(
+                        endpoint=a_endpoint, route_key=attempt_route, model=a_model, kind="transient"
+                    )
                     _emit(
                         trace_id,
                         span_id,
                         parent_id=parent_id,
-                        route=route_key,
+                        route=attempt_route,
                         intent=intent,
-                        backend=backend,
-                        model=model,
-                        quota_tier=quota_tier,
-                        status="FAIL",
+                        backend=a_backend,
+                        model=a_model,
+                        quota_tier=a_tier,
+                        status="TIMEOUT",
                         step=err_msg,
+                        tokens_in=tok_in,
+                        tokens_out=tok_out,
                         elapsed_ms=elapsed_ms,
                         error=err_msg,
                         profile=profile,
                         events_path=events_path,
                         on_event=on_event,
                     )
-                    return _finish(ExecutionResult(
-                        trace_id, span_id, route_key, backend, model, quota_tier, "FAIL", "", 0, 0, elapsed_ms, err_msg
-                    ))
-                if prefix:
-                    user_msg["content"] = prefix + prompt
-                if image_b64:
-                    user_msg["images"] = [image_b64]
-            messages.append(user_msg)
-
-            out_chunks: list[str] = []
-            thinking_chunks: list[str] = []
-            tok_in = tok_out = 0
-            cancelled = timed_out = False
-            errors: list[str] = []
-            saw_tool_after_call = False
-            deadline = time.monotonic() + max(0.1, timeout_s)
-
-            for _round in range(4):
-                if cancel_event is not None and cancel_event.is_set():
-                    cancelled = True
-                    break
-                if deadline - time.monotonic() <= 0:
-                    timed_out = True
-                    break
-
-                body: dict[str, Any] = {"model": model, "messages": messages, "stream": True}
-                if http_kind == "ollama" and resolved_think is not None:
-                    body["think"] = resolved_think
-                if route_cfg.get("tools") is not False:
-                    body["tools"] = [SEND_FILE_TOOL_SCHEMA]
-                payload = json.dumps(body).encode("utf-8")
-
-                round_chunks: list[str] = []
-                ollama_calls: list[dict[str, Any]] = []
-                openai_compat_slots: dict[int, dict[str, Any]] = {}
-                round_in = round_out = 0
-                resp_box: list = []
-                closed = threading.Event()
-                sink: "queue.Queue[Optional[str]]" = queue.Queue()
-                reader = threading.Thread(
-                    target=_read_http_response,
-                    args=(endpoint, payload, timeout_s, closed, resp_box, errors, sink),
-                    daemon=True,
-                )
-                reader.start()
-                try:
-                    while True:
-                        if cancel_event is not None and cancel_event.is_set():
-                            cancelled = True
-                            break
-                        remaining = deadline - time.monotonic()
-                        if remaining <= 0:
-                            timed_out = True
-                            break
-                        try:
-                            line = sink.get(timeout=min(0.1, remaining))
-                        except queue.Empty:
-                            continue
-                        if line is None:
-                            break
-                        for obj in _stream_objects(line, http_kind):
-                            if http_kind == "ollama":
-                                thinking, text = _ollama_stream_chunk(obj)
-                                ollama_calls.extend(_ollama_tool_calls(obj))
-                                if obj.get("done"):
-                                    round_in = int(obj.get("prompt_eval_count") or round_in)
-                                    round_out = int(obj.get("eval_count") or round_out)
-                            else:
-                                thinking, text = _openai_compat_stream_chunk(obj)
-                                _openai_compat_tool_delta(obj, openai_compat_slots)
-                                usage = obj.get("usage") if isinstance(obj.get("usage"), dict) else {}
-                                round_in = int(usage.get("prompt_tokens") or round_in)
-                                round_out = int(usage.get("completion_tokens") or round_out)
-                            if thinking:
-                                thinking_chunks.append(thinking)
-                                think_printer.push(thinking)
-                                if on_stream is not None:
-                                    on_stream("thinking", thinking)
-                            if text:
-                                think_printer.flush()
-                                piece = _markdown_piece("".join(out_chunks), text, True) if saw_tool_after_call else text
-                                saw_tool_after_call = False
-                                out_chunks.append(piece)
-                                round_chunks.append(piece)
-                                if on_stream is not None:
-                                    on_stream("text", piece)
-                finally:
-                    closed.set()
-                    for sock in resp_box:
-                        if sock is None:
-                            continue
-                        try:
-                            sock.shutdown(socket.SHUT_RDWR)
-                        except OSError:
-                            pass
-                    reader.join(timeout=1.0)
-
-                tok_in += round_in
-                tok_out += round_out
-                round_calls = ollama_calls if http_kind == "ollama" else _finalize_openai_compat_calls(openai_compat_slots)
-                if cancelled or timed_out or (errors and not round_calls) or not round_calls:
-                    break
-
-                messages.append(
-                    {
-                        "role": "assistant",
-                        "content": "".join(round_chunks),
-                        "tool_calls": [
-                            {
-                                "type": "function",
-                                **({"id": tc["id"]} if tc.get("id") else {}),
-                                "function": {
-                                    "name": tc["name"],
-                                    "arguments": tc["arguments"] if http_kind == "ollama" else tc["raw_args"],
-                                },
-                            }
-                            for tc in round_calls
-                        ],
-                    }
-                )
-                for tc in round_calls:
-                    t_name = tc["name"] or "send_file"
-                    tool_res, summary = _run_drop_tool_call(tc, drop_dir=drop_dir)
-                    tool_count += 1
-                    think_printer.flush()
+                    return ExecutionResult(
+                        trace_id, span_id, attempt_route, a_backend, a_model, a_tier, "TIMEOUT", out_text,
+                        tok_in, tok_out, elapsed_ms, err_msg,
+                        thinking="".join(thinking_chunks).strip(),
+                    ), saw_first_byte
+                if errors and not out_text:
+                    err_msg = _humanize_error(errors[0], 240)
+                    _HEALTH_TRACKER.record_failure(
+                        endpoint=a_endpoint,
+                        route_key=attempt_route,
+                        model=a_model,
+                        kind=classify_http_error(err_msg),
+                    )
                     _emit(
                         trace_id,
                         span_id,
                         parent_id=parent_id,
-                        route=route_key,
+                        route=attempt_route,
                         intent=intent,
-                        backend=backend,
-                        model=model,
-                        quota_tier=quota_tier,
-                        status="RUNNING",
-                        step=f"tool:{t_name}",
-                        elapsed_ms=int((time.monotonic() - t0) * 1000),
+                        backend=a_backend,
+                        model=a_model,
+                        quota_tier=a_tier,
+                        status="FAIL",
+                        step="http stream error",
+                        elapsed_ms=elapsed_ms,
+                        error=err_msg,
                         profile=profile,
                         events_path=events_path,
                         on_event=on_event,
                     )
-                    if on_stream is not None:
-                        on_stream("tool", summary)
-                    if emit_stderr and _status_enabled(verbosity):
-                        print(
-                            status_line("step", f"{_route_label(route_key)} · tool {tool_count}: {summary}", color=enabled),
-                            file=sys.stderr,
-                        )
-                    tool_msg: dict[str, Any] = {
-                        "role": "tool",
-                        "tool_name": t_name,
-                        "content": json.dumps(tool_res),
-                    }
-                    if tc.get("id"):
-                        tool_msg["tool_call_id"] = tc["id"]
-                    messages.append(tool_msg)
-                saw_tool_after_call = True
+                    return ExecutionResult(
+                        trace_id, span_id, attempt_route, a_backend, a_model, a_tier, "FAIL", "", 0, 0, elapsed_ms, err_msg
+                    ), saw_first_byte
 
-            elapsed_ms = int((time.monotonic() - t0) * 1000)
-            out_text = "".join(out_chunks).strip()
-            if not tok_in:
-                tok_in = max(1, len(prompt) // 4)
-            if not tok_out and out_text:
-                tok_out = max(1, len(out_text) // 4)
-
-            if cancelled:
-                return _finish(
-                    _interrupted(out_text, tok_in, tok_out, thinking="".join(thinking_chunks).strip())
+                _HEALTH_TRACKER.record_success(
+                    endpoint=a_endpoint, route_key=attempt_route, model=a_model, elapsed_ms=attempt_ms
                 )
-            if timed_out:
-                err_msg = f"Timed out after {timeout_s:.0f}s"
                 _emit(
                     trace_id,
                     span_id,
                     parent_id=parent_id,
-                    route=route_key,
+                    route=attempt_route,
                     intent=intent,
-                    backend=backend,
-                    model=model,
-                    quota_tier=quota_tier,
-                    status="TIMEOUT",
-                    step=err_msg,
+                    backend=a_backend,
+                    model=a_model,
+                    quota_tier=a_tier,
+                    status="DONE",
+                    step="http stream complete",
                     tokens_in=tok_in,
                     tokens_out=tok_out,
                     elapsed_ms=elapsed_ms,
-                    error=err_msg,
                     profile=profile,
                     events_path=events_path,
                     on_event=on_event,
                 )
-                return _finish(ExecutionResult(
-                    trace_id, span_id, route_key, backend, model, quota_tier, "TIMEOUT", out_text,
-                    tok_in, tok_out, elapsed_ms, err_msg,
+                return ExecutionResult(
+                    trace_id, span_id, attempt_route, a_backend, a_model, a_tier, "DONE", out_text, tok_in, tok_out, elapsed_ms,
                     thinking="".join(thinking_chunks).strip(),
-                ))
-            if errors and not out_text:
-                err_msg = _humanize_error(errors[0], 240)
+                ), saw_first_byte
+
+            primary_kind = "ollama" if backend == "ollama" else "openai-compat"
+            primary_ep = _http_endpoint(route_cfg, primary_kind)
+            fb_target = _resolve_http_fallback(route_key, route_cfg) if allow_fallback else None
+            if fb_target and _HEALTH_TRACKER.is_cooled_down(endpoint=primary_ep, route_key=route_key, model=model):
+                fb_key, fb_cfg = fb_target
+                fb_kind = "ollama" if fb_cfg.get("backend") == "ollama" else "openai-compat"
+                fb_ep = _http_endpoint(fb_cfg, fb_kind)
+                if not _HEALTH_TRACKER.is_cooled_down(endpoint=fb_ep, route_key=fb_key, model=str(fb_cfg.get("model", ""))):
+                    if on_stream is not None:
+                        on_stream("status", f"cooldown fallback -> @{fb_key}")
+                    result, _ = _http_attempt(fb_key, fb_cfg)
+                    return _finish(result)
+
+            result, saw_first_byte = _http_attempt(route_key, route_cfg)
+            if (
+                result.status in ("FAIL", "TIMEOUT")
+                and allow_fallback
+                and not saw_first_byte
+                and classify_http_error(result.error) != "auth"
+                and fb_target is not None
+            ):
+                fb_key, fb_cfg = fb_target
+                fb_model = str(fb_cfg.get("model", ""))
+                fb_tier = str(fb_cfg.get("quota_tier", "FREE"))
                 _emit(
                     trace_id,
                     span_id,
                     parent_id=parent_id,
-                    route=route_key,
+                    route=fb_key,
                     intent=intent,
-                    backend=backend,
-                    model=model,
-                    quota_tier=quota_tier,
-                    status="FAIL",
-                    step="http stream error",
-                    elapsed_ms=elapsed_ms,
-                    error=err_msg,
+                    backend=fb_cfg.get("backend", backend),
+                    model=fb_model,
+                    quota_tier=fb_tier,
+                    status="RUNNING",
+                    step=f"fallback->{fb_key}:{fb_model}",
+                    elapsed_ms=int((time.monotonic() - t0) * 1000),
                     profile=profile,
                     events_path=events_path,
                     on_event=on_event,
                 )
-                return _finish(ExecutionResult(
-                    trace_id, span_id, route_key, backend, model, quota_tier, "FAIL", "", 0, 0, elapsed_ms, err_msg
-                ))
-
-            _emit(
-                trace_id,
-                span_id,
-                parent_id=parent_id,
-                route=route_key,
-                intent=intent,
-                backend=backend,
-                model=model,
-                quota_tier=quota_tier,
-                status="DONE",
-                step="http stream complete",
-                tokens_in=tok_in,
-                tokens_out=tok_out,
-                elapsed_ms=elapsed_ms,
-                profile=profile,
-                events_path=events_path,
-                on_event=on_event,
-            )
-            return _finish(ExecutionResult(
-                trace_id, span_id, route_key, backend, model, quota_tier, "DONE", out_text, tok_in, tok_out, elapsed_ms,
-                thinking="".join(thinking_chunks).strip(),
-            ))
+                if on_stream is not None:
+                    on_stream("status", f"fallback -> @{fb_key} ({fb_tier})")
+                if emit_stderr and _status_enabled(verbosity):
+                    print(
+                        status_line("warn", f"{_route_label(route_key)} · fallback -> @{fb_key} ({fb_tier})", color=enabled),
+                        file=sys.stderr,
+                    )
+                think_printer.flush()
+                think_printer.reset_attempt()
+                result, _ = _http_attempt(fb_key, fb_cfg)
+            return _finish(result)
 
         if backend == "agy":
             if system_persona or handoff_context:

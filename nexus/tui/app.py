@@ -145,6 +145,7 @@ SLASH_COMMANDS: list[tuple[str, str, str]] = [
     ("/new", "", "Open a fresh session"),
     ("/sessions", "", "Switch, create or delete a session"),
     ("/theme", "[name]", "Switch the TUI theme"),
+    ("/ui", "[webui|cli]", "Switch between Gemini WebUI and CLI modes (Ctrl+G)"),
     ("/sidebar", "", "Toggle the inspector sidebar"),
     ("/verbose", "[0-2]", "Set detail and thinking visibility"),
     ("/quiet", "", "Status lines and tree off (verbosity 0)"),
@@ -229,6 +230,7 @@ class NexusCommandProvider(Provider):
             ("Expand/collapse all tool groups", "Ctrl+O · fold or unfold tool activity", app.action_toggle_tools),
             ("Cycle verbosity", "0 quiet · 1 default · 2 verbose", app.action_cycle_verbosity),
             ("Switch theme", "Ctrl+T · live-preview every bundled theme", app.action_pick_theme),
+            ("Toggle UI mode (WebUI / CLI)", f"Ctrl+G · current: {app.ui_mode}", app.action_toggle_ui_mode),
             ("Copy last assistant response", "/copy · clipboard via OSC 52 or wl-copy", app.action_copy_last),
             ("Save last code block to drop folder", "/save [filename] · writes to drops folder", app.prefill_save),
             ("Launch external harness TUI", "/tui · open external CLI TUI for this session", app.action_launch_tui),
@@ -260,6 +262,7 @@ class NexusApp(App[None]):
         Binding("ctrl+n", "new_session_tab", "New session", priority=True),
         Binding("ctrl+l", "pick_session", "Sessions", priority=True),
         Binding("ctrl+t", "pick_theme", "Theme", priority=True),
+        Binding("ctrl+g", "toggle_ui_mode", "UI Mode", show=False),
         Binding("ctrl+o", "toggle_tools", "Tools", priority=True),
         Binding("ctrl+tab", "next_tab", "Next tab", show=False, priority=True),
         Binding("alt+right", "next_tab", "Next tab", show=False, priority=True),
@@ -288,6 +291,7 @@ class NexusApp(App[None]):
         history_path: Optional[Path] = None,
         profile: Optional[str] = None,
         entity_mode: Optional[bool] = None,
+        ui_mode: Optional[str] = None,
     ) -> None:
         super().__init__()
         self.events_path = Path(events_path)
@@ -345,6 +349,8 @@ class NexusApp(App[None]):
             show_sidebar = bool(self.config.get("sidebar_open", True))
         self._sidebar_open = bool(show_sidebar)
         self._sidebar_manual_narrow = False
+        raw_ui = str(ui_mode if ui_mode is not None else self.config.get("ui_mode", "webui")).strip().lower()
+        self._ui_mode = "cli" if raw_ui in ("cli", "console") else "webui"
 
         self._busy: set[str] = set()
         self._cancel_events: dict[str, threading.Event] = {}
@@ -393,6 +399,7 @@ class NexusApp(App[None]):
             except NoMatches:
                 pass
         self._apply_sidebar(self._sidebar_open)
+        self._apply_ui_mode(self._ui_mode, persist=False, swap_default_theme=False)
         self._render_active_session()
         self._sync_state()
         self._focus_composer()
@@ -534,14 +541,17 @@ class NexusApp(App[None]):
         self._update_hints()
 
     def _update_hints(self) -> None:
-        hints = (
-            "[dim]Enter[/] send · [dim]⇧Enter[/] newline · [dim]Tab[/] accept · "
-            "[dim]^P[/] cmd · [dim]^K[/] route · [dim]^B[/] sidebar · "
-            "[dim]^O[/] thinking/tools · [dim]F1[/] help · [dim]^Q[/] quit"
-        )
-        if self.verbosity != 1:
-            label = _LLM_VERBOSITY_LABELS.get(self.verbosity, "default")
-            hints += f"  [dim]· verbosity {self.verbosity} ({label})[/]"
+        if self._ui_mode == "webui" and not self._busy:
+            hints = HintFooter.WEBUI_HINTS
+        else:
+            hints = (
+                "[dim]Enter[/] send · [dim]⇧Enter[/] newline · [dim]Tab[/] accept · "
+                "[dim]^P[/] cmd · [dim]^K[/] route · [dim]^B[/] sidebar · "
+                "[dim]^O[/] thinking/tools · [dim]F1[/] help · [dim]^Q[/] quit"
+            )
+            if self.verbosity != 1:
+                label = _LLM_VERBOSITY_LABELS.get(self.verbosity, "default")
+                hints += f"  [dim]· verbosity {self.verbosity} ({label})[/]"
         if hints == self._last_hints:
             return
         self._last_hints = hints
@@ -631,7 +641,7 @@ class NexusApp(App[None]):
             return
         session = self.active_session
         if session is None or not session.items:
-            transcript.mount(HomeHero())
+            transcript.mount(HomeHero(ui_mode=self._ui_mode))
             return
         widgets = []
         for item in session.items:
@@ -658,7 +668,7 @@ class NexusApp(App[None]):
             return pill
         if kind == "tools":
             group = ToolActivityGroup(
-                collapsed=not (
+                collapsed=(self._ui_mode == "webui") or not (
                     self.verbosity >= 1 and bool(item.thinking or item.tools)
                 ),
                 verbosity=self.verbosity,
@@ -772,7 +782,50 @@ class NexusApp(App[None]):
 
     # -- actions: bindings -------------------------------------------------
 
+    @property
+    def ui_mode(self) -> str:
+        return self._ui_mode
+
+    def _apply_ui_mode(
+        self,
+        mode: str,
+        *,
+        persist: bool = True,
+        swap_default_theme: bool = False,
+    ) -> None:
+        target = "cli" if str(mode).strip().lower() in ("cli", "console") else "webui"
+        self._ui_mode = target
+        try:
+            self.screen.set_class(target == "webui", "ui-webui")
+        except Exception:
+            pass
+        if swap_default_theme:
+            if target == "webui" and self.theme == "nexus-charcoal":
+                self.theme = "gemini-dark"
+                self.config["theme"] = "gemini-dark"
+            elif target == "cli" and self.theme == "gemini-dark":
+                self.theme = "nexus-charcoal"
+                self.config["theme"] = "nexus-charcoal"
+        if target == "cli":
+            self._apply_sidebar(self._sidebar_open)
+        try:
+            self.query_one("#home-hero", HomeHero).set_ui_mode(target)
+        except NoMatches:
+            pass
+        self._update_hints()
+        if persist:
+            self.config["ui_mode"] = target
+            self._save_config()
+
+    def action_toggle_ui_mode(self) -> None:
+        next_mode = "cli" if self._ui_mode == "webui" else "webui"
+        self._apply_ui_mode(next_mode, persist=True, swap_default_theme=True)
+        self.notify(f"UI mode → {self._ui_mode} (Ctrl+G)", timeout=2)
+
     def action_toggle_sidebar(self) -> None:
+        if self._ui_mode == "webui":
+            self.notify("Sidebar is available in CLI mode (Ctrl+G)", timeout=2)
+            return
         self._apply_sidebar(not self._sidebar_open, manual=True)
 
     def action_new_session_tab(self) -> None:
@@ -1727,6 +1780,18 @@ class NexusApp(App[None]):
                 self.action_pick_theme()
             else:
                 self._apply_theme(argument)
+        elif command == "/ui":
+            target = argument.strip().lower()
+            if not target:
+                self.action_toggle_ui_mode()
+            elif target in ("webui", "web", "gemini"):
+                self._apply_ui_mode("webui", persist=True, swap_default_theme=True)
+                self.notify("UI mode → webui (Ctrl+G)", timeout=2)
+            elif target in ("cli", "console"):
+                self._apply_ui_mode("cli", persist=True, swap_default_theme=True)
+                self.notify("UI mode → cli (Ctrl+G)", timeout=2)
+            else:
+                self.notify("Usage: /ui [webui|cli]", severity="warning", timeout=3)
         elif command == "/sidebar":
             self.action_toggle_sidebar()
         elif command == "/verbose":
@@ -2123,7 +2188,7 @@ class NexusApp(App[None]):
         )
 
         tools = ToolActivityGroup(
-            collapsed=(self.verbosity == 0),
+            collapsed=(self._ui_mode == "webui") or (self.verbosity == 0),
             verbosity=self.verbosity,
         )
         assistant = AssistantMessageCard()
@@ -2553,7 +2618,7 @@ class NexusApp(App[None]):
         )
 
         tools = ToolActivityGroup(
-            collapsed=(self.verbosity == 0),
+            collapsed=(self._ui_mode == "webui") or (self.verbosity == 0),
             verbosity=self.verbosity,
         )
         assistant = AssistantMessageCard()
@@ -3001,7 +3066,7 @@ class NexusApp(App[None]):
 
     def on_resize(self, event: events.Resize) -> None:
         width = event.size.width or 0
-        if width < 100 and self._sidebar_open and not self._sidebar_manual_narrow:
+        if self._ui_mode != "webui" and width < 100 and self._sidebar_open and not self._sidebar_manual_narrow:
             self._apply_sidebar(False)
         try:
             for card in self.query(CouncilGridCard):

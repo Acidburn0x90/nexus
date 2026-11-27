@@ -33,6 +33,7 @@ def run_tui(
     show_sidebar: Optional[bool] = None,
     profile: Optional[str] = None,
     entity_mode: Optional[bool] = None,
+    ui_mode: Optional[str] = None,
 ) -> int:
     """Run the full-screen Nexus TUI and return a process exit code."""
     NexusApp(
@@ -48,5 +49,6 @@ def run_tui(
         show_sidebar=show_sidebar,
         profile=profile,
         entity_mode=entity_mode,
+        ui_mode=ui_mode,
     ).run()
     return 0

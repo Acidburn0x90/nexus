@@ -564,17 +564,38 @@ class HomeHero(Vertical):
     }
     """
 
-    def __init__(self, *children: Any, **kwargs: Any) -> None:
+    def __init__(self, *children: Any, ui_mode: str = "cli", **kwargs: Any) -> None:
         kwargs.setdefault("id", "home-hero")
         super().__init__(*children, **kwargs)
+        self._ui_mode = "cli" if str(ui_mode).strip().lower() == "cli" else "webui"
         self._front_desk_model = "opencode/nemotron-3.5-lightning-free"
         self._quota_tier = "FREE"
         self._tip_index = 0
         self._tip_timer: Any = None
 
+    def _banner_text(self) -> str:
+        if self._ui_mode == "webui":
+            return "[bold]Hello.[/]\n[dim]What can I help with?[/]"
+        return "[bold]N E X U S[/]\n[dim]multi-model delegation console[/]"
+
+    def set_ui_mode(self, mode: str) -> None:
+        self._ui_mode = "cli" if str(mode).strip().lower() == "cli" else "webui"
+        if self._ui_mode == "webui":
+            if self._tip_timer is not None:
+                self._tip_timer.stop()
+                self._tip_timer = None
+        elif self.is_mounted and self._tip_timer is None:
+            self._tip_timer = self.set_interval(7.0, self._rotate_tip)
+        if not self.is_mounted:
+            return
+        try:
+            self.query_one(".hero-banner", Static).update(self._banner_text())
+        except NoMatches:
+            return
+
     def compose(self) -> ComposeResult:
         yield Static(
-            "[bold]N E X U S[/]\n[dim]multi-model delegation console[/]",
+            self._banner_text(),
             classes="hero-banner",
         )
         yield Static(self._front_desk_text(), classes="hero-model")
@@ -586,7 +607,8 @@ class HomeHero(Vertical):
         yield Static(self._tip_text(), classes="hero-tip")
 
     def on_mount(self) -> None:
-        self._tip_timer = self.set_interval(7.0, self._rotate_tip)
+        if self._ui_mode != "webui":
+            self._tip_timer = self.set_interval(7.0, self._rotate_tip)
 
     def on_unmount(self) -> None:
         if self._tip_timer is not None:
@@ -2326,6 +2348,10 @@ class HintFooter(Static):
         "[dim]Enter[/] send  [dim]⇧Enter[/] newline  [dim]Tab[/] accept  "
         "[dim]↑/↓[/] history  [dim]Ctrl+B[/] sidebar  [dim]Ctrl+P[/] commands  "
         "[dim]Ctrl+O[/] thinking/tools  [dim]Ctrl+Q[/] quit"
+    )
+    WEBUI_HINTS = (
+        "[dim]Enter[/] send  [dim]⇧Enter[/] newline  [dim]Ctrl+G[/] CLI mode  "
+        "[dim]Ctrl+P[/] commands  [dim]Ctrl+Q[/] quit"
     )
 
     DEFAULT_CSS = """

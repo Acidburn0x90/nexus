@@ -26,6 +26,7 @@ from nexus.evolve import (
     CANONICAL_DIRECTIVES,
     DEFAULT_BENCHMARK_PATH,
     DEFAULT_POLICY_PATH,
+    PROACTIVE_RESEARCH_DIRECTIVES,
     TRANSFER_TIERS,
     BenchmarkSpec,
     EvalReport,
@@ -33,8 +34,10 @@ from nexus.evolve import (
     apply_edits_in_sandbox,
     build_proposer_prompt,
     build_selector_prompt,
+    detect_improvement_opportunities,
     evaluate_split,
     parse_json_object,
+    render_improvement_opportunities,
     run_cold_start_challenger,
     run_evolve_loop,
     run_evolve_round,
@@ -998,3 +1001,29 @@ def test_no_personal_strings_in_owned_files():
         text = (PROJECT_ROOT / rel).read_text(encoding="utf-8")
         for needle in needles:
             assert needle not in text, f"{rel} leaks personal string {needle!r}"
+
+
+def test_proactive_research_directives_and_open_questions(mini_spec, routes_data, tmp_path):
+    assert len(CANONICAL_DIRECTIVES) == 10
+    assert len(PROACTIVE_RESEARCH_DIRECTIVES) >= 4
+    ws = tmp_path / "ws"
+    (ws / "config").mkdir(parents=True)
+    (ws / "config" / "routes.json").write_text(json.dumps(routes_data), encoding="utf-8")
+    base_eval = evaluate_split(ws, mini_spec, split="evolve")
+    prompt = build_proposer_prompt(
+        sim.new_ledger(domain="routing"),
+        base_eval,
+        {"config/routes.json": json.dumps(routes_data)},
+        round_num=1,
+        domain="routing",
+        policy_models=["code"],
+        objective="accuracy",
+        policy=ScopePolicy.for_scope("routes"),
+        spec=mini_spec,
+    )
+    assert PROACTIVE_RESEARCH_DIRECTIVES[0] in prompt
+
+    opps = detect_improvement_opportunities([], ledger=sim.new_ledger(domain="routing"), routes_data=routes_data)
+    assert opps and all(o.get("open_question") for o in opps)
+    rendered = render_improvement_opportunities(opps, color=False)
+    assert "ask:" in rendered

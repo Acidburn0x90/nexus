@@ -2231,6 +2231,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("-r", "--route", default=None, help="Explicit route override (e.g. code, reason, refactor, vision)")
     parser.add_argument("--profile", default=None, help="Configuration profile name or JSON path (default, free-only, local-only, ensemble)")
     parser.add_argument("--sticky", action="store_true", help="Use classic sticky orchestrator locking instead of unified entity routing")
+    parser.add_argument("--ui", choices=("webui", "cli"), default=None, help="Initial TUI mode (webui or cli)")
     parser.add_argument(
         "--repl",
         action="store_true",
@@ -2329,8 +2330,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_sq_board.add_argument("content", nargs="*", help="New markdown content (or 'clear')")
 
     p_tui = subparsers.add_parser("tui", help="Launch the full-screen Textual TUI")
-    p_tui.add_argument("--theme", default=None, help="Initial theme (nexus-charcoal, oled-black, opencode-dark, github-slate, catppuccin-mocha)")
+    p_tui.add_argument("--theme", default=None, help="Initial theme (nexus-charcoal, oled-black, opencode-dark, github-slate, catppuccin-mocha, gemini-dark)")
     p_tui.add_argument("--no-sidebar", action="store_true", help="Start with the inspector sidebar hidden")
+    p_tui.add_argument("--ui", choices=("webui", "cli"), default=argparse.SUPPRESS, help="Initial TUI mode (webui or cli)")
     p_tui.add_argument("--profile", default=argparse.SUPPRESS, help="Initial profile name or JSON path")
     p_tui.add_argument("--sticky", action="store_true", default=argparse.SUPPRESS, help="Use sticky orchestrator routing")
     # `default=argparse.SUPPRESS` keeps a global `nexus --dry-run tui` from being
@@ -2491,7 +2493,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     # Allow bare `nexus "@reason Prompt"` or `nexus "Prompt"` shorthand, including
     # when global flags come first (`nexus --dry-run "@code hello"`). Walk past
     # flags and their values to find the first positional token.
-    value_flags = {"--events-file", "-r", "--route", "--profile"}
+    value_flags = {"--events-file", "-r", "--route", "--profile", "--ui"}
     position = 0
     implicit_index: Optional[int] = None
     while position < len(raw_args):
@@ -2547,6 +2549,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                 show_sidebar=False if getattr(args, "no_sidebar", False) else None,
                 profile=profile_name,
                 entity_mode=False if sticky_flag else None,
+                ui_mode=getattr(args, "ui", None),
             )
 
         if args.subcommand == "routes":
@@ -2635,6 +2638,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                     verbosity=tui_verbosity,
                     profile=profile_name,
                     entity_mode=False if sticky_flag else None,
+                    ui_mode=getattr(args, "ui", None),
                 )
 
         return run_repl(

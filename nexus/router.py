@@ -116,11 +116,37 @@ def _normalise_model(name: str) -> str:
 
 
 def _model_matches(model: str, names: list[str]) -> bool:
-    """Exact match, treating `foo` and `foo:latest` as the same model."""
+    """Exact match, treating `foo` and `foo:latest` as the same model, plus virtual auto routes."""
     if not model:
         return False
+    if model == "auto" or model.startswith("auto/"):
+        if model in names or "auto" in names:
+            return True
+        if model.startswith("auto/") and bool(names):
+            return True
+    if model.startswith("openrouter/openrouter/") and model[len("openrouter/"):] in names:
+        return True
     wanted = _normalise_model(model)
     return any(_normalise_model(name) == wanted for name in names if name)
+
+
+def resolve_route_api_key(route_cfg: dict) -> str:
+    """Resolve an optional Bearer token from ``api_key_env``, ``api_key_file``, or ``api_key``."""
+    env_name = str(route_cfg.get("api_key_env") or "").strip()
+    if env_name:
+        val = os.environ.get(env_name, "").strip()
+        if val:
+            return val
+    key_file = str(route_cfg.get("api_key_file") or "").strip()
+    if key_file:
+        try:
+            val = Path(key_file).expanduser().read_text(encoding="utf-8").strip()
+            if val:
+                return val
+        except OSError:
+            pass
+    literal = str(route_cfg.get("api_key") or "").strip()
+    return literal
 
 
 def _probe_url(base: str, backend: str) -> str:
@@ -169,8 +195,13 @@ def probe_local_endpoints(
             results[key] = info
             continue
 
+        headers: dict[str, str] = {}
+        api_key = resolve_route_api_key(cfg)
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+        req = urllib.request.Request(_probe_url(base, backend), headers=headers)
         try:
-            with _HTTP_OPENER.open(_probe_url(base, backend), timeout=timeout_s) as response:
+            with _HTTP_OPENER.open(req, timeout=timeout_s) as response:
                 status = int(getattr(response, "status", 200))
                 payload = json.loads(response.read().decode("utf-8", errors="replace"))
         except (OSError, urllib.error.URLError, ValueError, TimeoutError) as exc:

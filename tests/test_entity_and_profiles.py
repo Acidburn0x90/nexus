@@ -206,3 +206,11 @@ def test_execute_route_forwards_profile_and_session_migrates(tmp_path: Path) -> 
     assert loaded[0].entity_mode is True
     assert loaded[0].premium_spans == 1
     assert isinstance(loaded[0], TuiSession)
+
+
+def test_default_system_persona_proactive_research_framing() -> None:
+    low = DEFAULT_SYSTEM_PERSONA.lower()
+    assert "research" in low or "papers" in low
+    assert "question" in low
+    prof = load_profile("default")
+    assert "question" in prof.system_persona.lower()

@@ -27,6 +27,7 @@ DEFAULT_TUI_CONFIG: dict[str, Any] = {
     "verbosity": 1,
     "profile": "default",
     "entity_mode": True,
+    "ui_mode": "webui",
 }
 
 

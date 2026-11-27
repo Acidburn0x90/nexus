@@ -278,6 +278,7 @@ def test_tui_config_roundtrip_and_defaults(tmp_path: Path) -> None:
         "verbosity": 1,
         "profile": "default",
         "entity_mode": True,
+        "ui_mode": "webui",
     }
 
     sessions.save_tui_config({"theme": "solar", "verbosity": 2}, path=path)
@@ -1191,3 +1192,171 @@ def test_openai_compat_sse_send_file_tool_loop(tmp_path: Path) -> None:
 def test_legacy_colibri_backend_sse_send_file_tool_loop(tmp_path: Path) -> None:
     """The legacy backend alias retains streamed send_file tool calls."""
     _exercise_openai_compatible_send_file(tmp_path, "colibri")
+
+
+def test_classify_http_error_and_health_tracker_ewma(monkeypatch) -> None:
+    assert backends.classify_http_error(401) == "auth"
+    assert backends.classify_http_error("HTTP 403: forbidden") == "auth"
+    assert backends.classify_http_error(429) == "quota"
+    assert backends.classify_http_error("HTTP 402 insufficient credits") == "quota"
+    assert backends.classify_http_error(503) == "transient"
+    assert backends.classify_http_error("timed out waiting") == "transient"
+    assert backends.classify_http_error("HTTP 400 bad request") == "other"
+
+    tracker = backends.RouteHealthTracker(alpha=0.3)
+    tracker.record_failure(endpoint="http://127.0.0.1:1/v1", route_key="r1", model="m1", kind="transient")
+    # Transient affects endpoint scope (even a different route sharing the endpoint sees it).
+    assert tracker.is_cooled_down(endpoint="http://127.0.0.1:1/v1", route_key="r2", model="m2")
+    assert not tracker.is_cooled_down(endpoint="http://127.0.0.1:2/v1", route_key="r2", model="m2")
+
+    tracker.record_failure(endpoint="http://127.0.0.1:2/v1", route_key="r2", model="m2", kind="quota")
+    assert tracker.is_cooled_down(endpoint="http://127.0.0.1:2/v1", route_key="r2", model="m2")
+    assert not tracker.is_cooled_down(endpoint="http://127.0.0.1:2/v1", route_key="r3", model="m2")
+
+    tracker.record_failure(endpoint="http://127.0.0.1:3/v1", route_key="r3", model="m3", kind="other")
+    assert tracker.is_cooled_down(endpoint="http://127.0.0.1:3/v1", route_key="r3", model="m3")
+    assert not tracker.is_cooled_down(endpoint="http://127.0.0.1:3/v1", route_key="r3", model="m4")
+
+    tracker.record_success(endpoint="http://127.0.0.1:3/v1", route_key="r3", model="m3", elapsed_ms=100.0)
+    assert not tracker.is_cooled_down(endpoint="http://127.0.0.1:3/v1", route_key="r3", model="m3")
+    assert abs((tracker.latency_ewma(endpoint="http://127.0.0.1:3/v1", route_key="r3", model="m3") or 0.0) - 100.0) < 1e-6
+    tracker.record_success(endpoint="http://127.0.0.1:3/v1", route_key="r3", model="m3", elapsed_ms=200.0)
+    assert abs((tracker.latency_ewma(endpoint="http://127.0.0.1:3/v1", route_key="r3", model="m3") or 0.0) - 130.0) < 1e-6
+
+    backends.reset_health_state()
+
+
+def _scripted_http_server(handler_fn):
+    @contextlib.contextmanager
+    def _ctx():
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self) -> None:  # noqa: N802
+                length = int(self.headers.get("Content-Length", "0"))
+                raw = self.rfile.read(length).decode("utf-8", errors="replace")
+                handler_fn(self, raw)
+
+            def log_message(self, *args) -> None:
+                return
+
+        srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        t = threading.Thread(target=srv.serve_forever, daemon=True)
+        t.start()
+        try:
+            yield f"http://127.0.0.1:{srv.server_address[1]}/v1/chat/completions"
+        finally:
+            srv.shutdown()
+            srv.server_close()
+
+    return _ctx()
+
+
+def test_http_bearer_auth_fallback_and_guards(tmp_path: Path) -> None:
+    backends.reset_health_state()
+    try:
+        calls: list[dict] = []
+        mode = {"case": "503_then_ok"}
+
+        def handle(req, raw: str) -> None:
+            path = req.path
+            auth = str(req.headers.get("Authorization") or "")
+            calls.append({"path": path, "auth": auth, "body": json.loads(raw)})
+            if mode["case"] == "401":
+                body = json.dumps({"error": {"message": "bad token"}}).encode("utf-8")
+                req.send_response(401)
+                req.send_header("Content-Type", "application/json")
+                req.send_header("Content-Length", str(len(body)))
+                req.end_headers()
+                req.wfile.write(body)
+                return
+            if mode["case"] == "503_then_ok" and path.endswith("/primary"):
+                body = json.dumps({"error": {"message": "upstream overloaded"}}).encode("utf-8")
+                req.send_response(503)
+                req.send_header("Content-Type", "application/json")
+                req.send_header("Content-Length", str(len(body)))
+                req.end_headers()
+                req.wfile.write(body)
+                return
+            if mode["case"] == "partial_then_drop" and path.endswith("/primary"):
+                req.send_response(200)
+                req.send_header("Content-Type", "text/event-stream")
+                req.end_headers()
+                req.wfile.write(b'data: {"choices":[{"delta":{"content":"partial "}}]}\n')
+                req.wfile.flush()
+                req.wfile.write(b"not-valid-finish")
+                return
+            req.send_response(200)
+            req.send_header("Content-Type", "text/event-stream")
+            req.end_headers()
+            req.wfile.write(b'data: {"choices":[{"delta":{"content":"fallback ok"}}]}\ndata: [DONE]\n')
+
+        with _scripted_http_server(handle) as base_url:
+            base = base_url.rsplit("/v1/", 1)[0]
+            key_file = tmp_path / "gw.key"
+            key_file.write_text("sk-gw-123\n", encoding="utf-8")
+            routes_file = tmp_path / "routes.json"
+            primary_cfg = {
+                "backend": "openai-compat",
+                "endpoint": f"{base}/primary",
+                "model": "m-primary",
+                "api_key_file": str(key_file),
+                "quota_tier": "FREE",
+                "timeout_s": 5,
+                "fallback_route": "local_fb",
+            }
+            fb_cfg = {
+                "backend": "openai-compat",
+                "endpoint": f"{base}/fb",
+                "model": "m-fb",
+                "quota_tier": "LOCAL",
+                "timeout_s": 5,
+            }
+            routes_file.write_text(json.dumps({"routes": {"omni": primary_cfg, "local_fb": fb_cfg}}), encoding="utf-8")
+
+            # 1) Pre-first-byte 503 captures HTTP body & falls back to fallback_route cleanly.
+            res1 = backends.execute_route(
+                "tr_fb1", "omni", primary_cfg, "hello",
+                events_path=tmp_path / "e1.jsonl", inject_square=False, emit_stderr=False, routes_path=routes_file,
+            )
+            assert res1.status == "DONE"
+            assert res1.route == "local_fb"
+            assert res1.output == "fallback ok"
+            assert calls[0]["auth"] == "Bearer sk-gw-123"
+
+            # 2) 401 auth error captures HTTP body and never retries or falls back blindly.
+            backends.reset_health_state()
+            calls.clear()
+            mode["case"] = "401"
+            res2 = backends.execute_route(
+                "tr_auth", "omni", primary_cfg, "hello",
+                events_path=tmp_path / "e2.jsonl", inject_square=False, emit_stderr=False, routes_path=routes_file,
+            )
+            assert res2.status == "FAIL"
+            assert "401" in res2.error and "bad token" in res2.error
+            assert len(calls) == 1
+
+            # 3) Post-first-byte guard: partial output is returned instead of switching streams mid-reply.
+            backends.reset_health_state()
+            calls.clear()
+            mode["case"] = "partial_then_drop"
+            res3 = backends.execute_route(
+                "tr_pfb", "omni", primary_cfg, "hello",
+                events_path=tmp_path / "e3.jsonl", inject_square=False, emit_stderr=False, routes_path=routes_file,
+            )
+            assert res3.output == "partial"
+            assert len(calls) == 1
+    finally:
+        backends.reset_health_state()
+
+
+def test_bounded_history_clears_old_tool_output_keeping_recent_verbatim() -> None:
+    bulky_tool = "[Tool output: ls -la]\n" + ("file-entry-line\n" * 30)
+    history = [
+        {"role": "user", "content": "old ask"},
+        {"role": "assistant", "content": bulky_tool},
+    ]
+    for i in range(6):
+        history.append({"role": "user" if i % 2 == 0 else "assistant", "content": f"recent-{i} " + ("x" * 260)})
+    kept = backends._bounded_history(history)
+    assert "[cleared old tool output" in kept[1]["content"]
+    assert kept[-1]["content"].startswith("recent-5 ")
+    assert len(kept[-1]["content"]) > 240

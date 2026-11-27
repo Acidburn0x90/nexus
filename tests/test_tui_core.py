@@ -50,6 +50,7 @@ def make_app(tmp_path: Path, **overrides: object) -> NexusApp:
         "history_path": tmp_path / "history",
         "routes_path": ROUTES_PATH,
         "dry_run": True,
+        "ui_mode": "cli",
     }
     kwargs.update(overrides)
     return NexusApp(**kwargs)  # type: ignore[arg-type]
@@ -474,3 +475,66 @@ def test_tool_activity_group_concise_titles_and_empty_body() -> None:
     running.append_thinking("Checking the failures")
     running._refresh()
     assert "thinking · 2 tools" in running.title
+
+
+def test_webui_default_mode_ctrl_g_and_slash_ui(tmp_path: Path, monkeypatch) -> None:
+    async def scenario() -> None:
+        app = make_app(tmp_path, ui_mode=None)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            assert app.ui_mode == "webui"
+            assert app.screen.has_class("ui-webui")
+            assert app.theme == "nexus-charcoal"
+            hero = app.query_one("#home-hero", HomeHero)
+            assert hero._tip_timer is None
+            banner_txt = str(hero.query_one(".hero-banner", Static).content)
+            assert "Hello." in banner_txt
+            assert "Ctrl+G" in str(app.query_one(HintFooter).content)
+
+            # Ctrl+G: webui -> cli, then cli -> webui swaps nexus-charcoal -> gemini-dark.
+            await pilot.press("ctrl+g")
+            await pilot.pause()
+            assert app.ui_mode == "cli"
+            assert not app.screen.has_class("ui-webui")
+            assert "N E X U S" in str(hero.query_one(".hero-banner", Static).content)
+
+            await pilot.press("ctrl+g")
+            await pilot.pause()
+            assert app.ui_mode == "webui"
+            assert app.theme == "gemini-dark"
+
+            await pilot.press("ctrl+g")
+            await pilot.pause()
+            assert app.ui_mode == "cli"
+            assert app.theme == "nexus-charcoal"
+
+            app._handle_slash("/ui webui")
+            await pilot.pause()
+            assert app.ui_mode == "webui"
+            saved = json.loads((tmp_path / "tui.json").read_text(encoding="utf-8"))
+            assert saved["ui_mode"] == "webui"
+            assert saved["theme"] == "gemini-dark"
+
+            assert resolve_theme_name("gemini-dark") == "gemini-dark"
+
+    asyncio.run(scenario())
+
+    import importlib.machinery
+    import importlib.util
+    import sys
+
+    bin_path = Path(__file__).resolve().parents[1] / "bin" / "nexus"
+    loader = importlib.machinery.SourceFileLoader("nexus_cli_ui_test", str(bin_path))
+    spec = importlib.util.spec_from_loader("nexus_cli_ui_test", loader)
+    assert spec is not None
+    cli = importlib.util.module_from_spec(spec)
+    sys.modules["nexus_cli_ui_test"] = cli
+    loader.exec_module(cli)
+
+    seen_ui: list[object] = []
+    import nexus.tui as tui_pkg
+
+    monkeypatch.setattr(tui_pkg, "run_tui", lambda **kw: seen_ui.append(kw.get("ui_mode")) or 0)
+    assert cli.main(["--dry-run", "tui", "--ui", "cli"]) == 0
+    assert cli.main(["--dry-run", "--ui", "webui", "tui"]) == 0
+    assert seen_ui == ["cli", "webui"]

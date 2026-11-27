@@ -65,6 +65,7 @@ def make_app(tmp_path: Path, **overrides: object) -> NexusApp:
         "history_path": tmp_path / "history",
         "routes_path": ROUTES_PATH,
         "dry_run": True,
+        "ui_mode": "cli",
     }
     kwargs.update(overrides)
     return NexusApp(**kwargs)  # type: ignore[arg-type]

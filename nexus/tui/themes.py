@@ -19,6 +19,7 @@ THEME_ORDER = [
     "opencode-dark",
     "github-slate",
     "catppuccin-mocha",
+    "gemini-dark",
 ]
 
 THEME_ALIASES: dict[str, str] = {"agy-slate": "github-slate"}
@@ -122,6 +123,26 @@ NEXUS_THEMES: dict[str, Theme] = {
             "border-blurred": "#313244",
             "footer-background": "#1e1e2e",
             "footer-foreground": "#a6adc8",
+        },
+    ),
+    "gemini-dark": Theme(
+        name="gemini-dark",
+        background="#131314",
+        surface="#1e1f20",
+        panel="#282a2c",
+        foreground="#e3e3e3",
+        primary="#8ab4f8",
+        secondary="#a8c7fa",
+        accent="#7fcfff",
+        success="#81c995",
+        warning="#fdd663",
+        error="#f28b82",
+        dark=True,
+        variables={
+            "border": "#333537",
+            "border-blurred": "#282a2c",
+            "footer-background": "#131314",
+            "footer-foreground": "#c4c7c5",
         },
     ),
 }

@@ -210,3 +210,81 @@ ModalScreen {
     border: solid $primary;
     padding: 1 2;
 }
+
+/* Gemini WebUI single-prompt reading layout */
+Screen.ui-webui #tab-bar,
+Screen.ui-webui #sidebar,
+Screen.ui-webui .routing-pill,
+Screen.ui-webui .assistant-receipt,
+Screen.ui-webui #composer-meta,
+Screen.ui-webui .user-meta,
+Screen.ui-webui #home-hero .hero-model,
+Screen.ui-webui #home-hero #hero-actions,
+Screen.ui-webui #home-hero .hero-tip {
+    display: none;
+}
+
+Screen.ui-webui #main-pane {
+    align-horizontal: center;
+}
+
+Screen.ui-webui #transcript {
+    scrollbar-gutter: stable;
+    padding: 1 2;
+    align-horizontal: center;
+}
+
+Screen.ui-webui #home-hero {
+    max-width: 88;
+    width: 100%;
+    background: transparent;
+    border: none;
+    margin: 4 2;
+    padding: 1 2;
+}
+
+Screen.ui-webui .user-card,
+Screen.ui-webui .tool-group,
+Screen.ui-webui .assistant-card,
+Screen.ui-webui .council-grid,
+Screen.ui-webui .system-note,
+Screen.ui-webui #composer-container,
+Screen.ui-webui #suggestion-popup {
+    max-width: 88;
+    width: 100%;
+}
+
+Screen.ui-webui .user-card {
+    border: none;
+    background: $surface;
+    padding: 1 2;
+    margin: 1 0 1 8;
+}
+
+Screen.ui-webui .assistant-card {
+    border: none;
+    background: transparent;
+    padding: 0 1;
+    margin: 0 0 1 0;
+}
+
+Screen.ui-webui #composer-container {
+    border: round $border-blurred;
+    background: $panel;
+    padding: 0 1;
+    margin: 0 2 1 2;
+}
+
+Screen.ui-webui #composer-container:focus-within {
+    border: round $primary;
+}
+
+Screen.ui-webui #composer-input {
+    background: $panel;
+}
+
+Screen.ui-webui #hint-footer {
+    background: $background;
+    color: $footer-foreground;
+    content-align: center middle;
+}

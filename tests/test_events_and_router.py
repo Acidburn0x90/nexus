@@ -26,6 +26,7 @@ from nexus.events import (
 )
 from nexus.router import (
     DEFAULT_ROUTES_PATH,
+    _model_matches,
     budget_allows,
     front_desk_decide,
     load_budgets,
@@ -33,6 +34,7 @@ from nexus.router import (
     list_opencode_models,
     probe_local_endpoints,
     resolve_route,
+    resolve_route_api_key,
     validate_routes,
 )
 
@@ -695,3 +697,67 @@ def test_front_desk_decide_parses_json_and_cached_tokens(monkeypatch) -> None:
     assert decision.tokens_in == 100  # 10 prompt + 90 cache-read tokens
     assert decision.tokens_out == 5
     assert decision.reason == "debate"
+
+
+def test_model_matches_supports_auto_virtual_routes() -> None:
+    assert _model_matches("auto", ["auto", "foo"]) is True
+    assert _model_matches("auto/best-free", ["auto", "qwen4"]) is True
+    assert _model_matches("auto/coding:free", ["qwen4"]) is True
+    assert _model_matches("auto/coding:free", []) is False
+    assert _model_matches("openrouter/openrouter/free", ["openrouter/free"]) is True
+    assert _model_matches("missing-model", ["qwen4"]) is False
+
+
+def test_resolve_route_api_key_precedence(monkeypatch, tmp_path: Path) -> None:
+    key_file = tmp_path / "gw.key"
+    key_file.write_text("file-secret\n", encoding="utf-8")
+
+    monkeypatch.setenv("NEXUS_TEST_GW_KEY", "env-secret")
+    assert resolve_route_api_key({"api_key_env": "NEXUS_TEST_GW_KEY", "api_key_file": str(key_file)}) == "env-secret"
+    monkeypatch.delenv("NEXUS_TEST_GW_KEY")
+    assert resolve_route_api_key({"api_key_env": "NEXUS_TEST_GW_KEY", "api_key_file": str(key_file)}) == "file-secret"
+    assert resolve_route_api_key({"api_key_file": str(tmp_path / "missing.key"), "api_key": "lit-secret"}) == "lit-secret"
+
+
+def test_probe_local_endpoints_sends_bearer_token(tmp_path: Path) -> None:
+    auth_seen: list[str] = []
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self) -> None:  # noqa: N802 - stdlib handler API
+            auth_seen.append(str(self.headers.get("Authorization") or ""))
+            payload = json.dumps({"data": [{"id": "openrouter/openrouter/free"}]}).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, *args) -> None:
+            return
+
+    key_file = tmp_path / "omni.key"
+    key_file.write_text("sk-test-omni\n", encoding="utf-8")
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    t = threading.Thread(target=srv.serve_forever, daemon=True)
+    t.start()
+    try:
+        endpoint = f"http://127.0.0.1:{srv.server_address[1]}/v1/chat/completions"
+        res = probe_local_endpoints(
+            {
+                "routes": {
+                    "omni": {
+                        "backend": "openai-compat",
+                        "endpoint": endpoint,
+                        "model": "auto/best-free",
+                        "api_key_file": str(key_file),
+                    }
+                }
+            }
+        )
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+    assert auth_seen == ["Bearer sk-test-omni"]
+    assert res["omni"]["reachable"] is True
+    assert res["omni"]["model_present"] is True

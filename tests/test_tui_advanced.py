@@ -52,6 +52,7 @@ def _paths(tmp_path: Path) -> dict[str, Path]:
 
 def _make_app(tmp_path: Path, **overrides) -> NexusApp:
     paths = _paths(tmp_path)
+    paths.setdefault("ui_mode", "cli")
     paths.update(overrides)
     return NexusApp(**paths)
 

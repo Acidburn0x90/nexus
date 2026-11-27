@@ -251,3 +251,17 @@ Operational notes:
 - `nexus evolve challenge --seed-dir ...` runs both lineages and reports held-out deltas. Use the recommendation as evidence, not as an automatic deployment gate; deterministic verifiers and human approval still decide promotion.
 
 For the benchmark and policy inputs, see `config/evals/routing_benchmark.json` and `config/sim_policy.json`. For the ledger and loop implementations, see `nexus/sim.py` and `nexus/evolve.py`.
+
+## 7. Proactive Research Directives & LifeOS-Inspired Evolution
+
+Alongside the ten canonical SIM directives (`D1`–`D10`), the Proposer injects four **Proactive Research Directives (`R1`–`R4`)** to eliminate passive stagnation even when baseline accuracy reaches `100%`:
+
+- **`R1` Unanswered Questions:** Treat every failure, roadblock, or dead end as an unanswered question with an explicit falsifiable hypothesis before editing.
+- **`R2` Research & OSS Grounding:** Check recent AI/CS literature and proven open-source harnesses before inventing custom mechanisms.
+- **`R3` Explicit `open_question`s:** Every suggestion emitted by `detect_improvement_opportunities()` / `nexus evolve suggest` carries an `open_question` (rendered as `ask: ...`) surfacing unresolved bottlenecks or assumptions.
+- **`R4` Proactive Squeeze:** Hunt higher-leverage gains in prompt framing, latency/compression, and compiled `native/` speedups even when functional accuracy is green.
+
+Queued in `tasks/todo.md` under LifeOS's **ISA (Ideal State Articulation) + Errata** architecture:
+
+- **Verbatim Errata & False-Pass Capture:** Record user dissatisfaction and post-`DONE` false passes into an append-only `errata.jsonl` joined directly to `trace_id`, feeding `nexus evolve suggest` without placing LLMs on the interactive hot path.
+- **Multi-Objective & GEPA Evolution:** Expand `nexus/evolve.py` with MAP-Elites/Pareto archives, trajectory-feedback prompt co-evolution, and sandbox network-egress / anti-reward-hacking guards.

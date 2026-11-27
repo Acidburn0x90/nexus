@@ -149,6 +149,13 @@ CANONICAL_DIRECTIVES: tuple[str, ...] = (
     "D10 Lock security boundaries, sandboxing, verifiers, and approval gates permanently outside editable scope.",
 )
 
+PROACTIVE_RESEARCH_DIRECTIVES: tuple[str, ...] = (
+    "R1 Treat every roadblock, failure, or dead end as an unanswered question—state the concrete question and falsifiable hypothesis before editing.",
+    "R2 Check the latest AI/CS research papers and proven open-source methods before inventing custom mechanisms.",
+    "R3 Surface unresolved assumptions, missing metrics, or architectural trade-offs explicitly as open_questions for the operator or next round.",
+    "R4 Proactively pursue higher-leverage improvements (prompt framing, routing resilience, compression, or native speedups) even when baseline accuracy is 100%.",
+)
+
 TRANSFER_TIERS: dict[str, str] = {
     "invariant": (
         "Tier 1 Durable Invariants: retain core execution loops, interfaces, and structural checks."
@@ -813,6 +820,10 @@ def build_proposer_prompt(
     for directive in CANONICAL_DIRECTIVES:
         lines.append(f"- {directive}")
     lines.append("")
+    lines.append("## Proactive research & inquiry directives")
+    for directive in PROACTIVE_RESEARCH_DIRECTIVES:
+        lines.append(f"- {directive}")
+    lines.append("")
     lines.append("## Improvement Incentive & Ladder")
     lines.append(
         "Always look for the simplest high-leverage win across the ladder below "
@@ -920,6 +931,10 @@ def build_selector_prompt(
     lines.append("")
     lines.append("## Canonical directives (mandatory)")
     for directive in CANONICAL_DIRECTIVES:
+        lines.append(f"- {directive}")
+    lines.append("")
+    lines.append("## Proactive research & inquiry directives")
+    for directive in PROACTIVE_RESEARCH_DIRECTIVES:
         lines.append(f"- {directive}")
     lines.append("")
     lines.append("## Complete SIM LEDGER (injected without truncation)")
@@ -2226,6 +2241,10 @@ def detect_improvement_opportunities(
                     "lever": "prompt_tune|profile_tune",
                     "target": f"@{route_name}",
                     "evidence": f"{int(metrics.get('done') or 0)}/{runs} succeeded ({success_rate:.0%})",
+                    "open_question": (
+                        f"Why is @{route_name} failing ({int(metrics.get('done') or 0)}/{runs}), and can "
+                        "prompt framing, free-tier failover, or recent OSS routing patterns raise it >=95%?"
+                    ),
                     "recommendation": (
                         f"Squeeze @{route_name} with sharper persona framing, tighter fallbacks, "
                         "or ensemble cross-checks to lift open-model reliability."
@@ -2256,6 +2275,10 @@ def detect_improvement_opportunities(
                     "lever": "code_refactor|polyglot_rewrite",
                     "target": f"@{route_name}",
                     "evidence": f"p95 latency {p95_ms / 1000:.1f}s over {runs} run(s)",
+                    "open_question": (
+                        f"Is @{route_name}'s {p95_ms / 1000:.1f}s p95 caused by prompt bloat, queuing, or "
+                        "Python hot paths solvable via compression or native/ Rust/C code?"
+                    ),
                     "recommendation": (
                         "Profile slow paths (streaming, parsing, router dispatch) and consider "
                         "Python optimization or a compiled native/ implementation."
@@ -2280,9 +2303,13 @@ def detect_improvement_opportunities(
                         "lever": "code_refactor|polyglot_rewrite",
                         "target": pid,
                         "evidence": f"{zero_fix} zero-fix attempt(s) on '{pname}'",
+                        "open_question": (
+                            f"What false assumption caused {zero_fix} zero-fix retries on '{pname}', "
+                            "and what recent AI/CS paper or OSS architecture solves it cleanly?"
+                        ),
                         "recommendation": (
-                            f"Escalating scope beyond config tweaks for {pid}: inspect root cause "
-                            "and refactor harness code or rewrite hot logic cleanly."
+                            f"Treat {pid} as an unanswered question: check recent AI/CS papers and "
+                            "existing OSS methods before refactoring harness or native/ code."
                         ),
                         "command": "nexus evolve --scope full --objective balanced",
                     }
@@ -2298,9 +2325,13 @@ def detect_improvement_opportunities(
                 "lever": "prompt_tune|code_refactor|polyglot_rewrite",
                 "target": "all",
                 "evidence": f"{int(stats.get('total_runs') or 0)} terminal span(s) healthy",
+                "open_question": (
+                    "Which recent AI/CS paper or OSS technique (compression, EWMA routing, or native/ hot path) "
+                    "yields the biggest zero-regression open-model gain next?"
+                ),
                 "recommendation": (
-                    "Benchmark profiles head-to-head and probe prompt, code, or native/ speedups "
-                    "while preserving 0 regressions."
+                    "Check recent AI/CS papers and OSS methods, benchmark profiles head-to-head, "
+                    "and probe prompt, compression, or native/ speedups with 0 regressions."
                 ),
                 "command": "nexus bench --profiles default,free-only,local-only --split held-out",
             }
@@ -2331,6 +2362,8 @@ def render_improvement_opportunities(
         header = f"{prio_tag} {target} · {evidence} · lever={lever}"
         lines.append(truncate_ansi(header, target_w - 4))
         lines.append(truncate_ansi(f"  why: {opp.get('recommendation', '')}", target_w - 4))
+        if opp.get("open_question"):
+            lines.append(truncate_ansi(f"  ask: {opp['open_question']}", target_w - 4))
         lines.append(
             truncate_ansi(
                 f"  try: {GREEN if color else ''}{opp.get('command', '')}{RESET if color else ''}",
