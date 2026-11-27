@@ -1,0 +1,183 @@
+{
+  "name": "nexus-routing-v1",
+  "domain": "routing",
+  "verifier": "builtin:routing",
+  "editable_files": [
+    "config/routes.json"
+  ],
+  "locked_files": [],
+  "evolve_tasks": [
+    {
+      "id": "evolve-triage-stream-filter",
+      "prompt": "Triage the attached stream and filter out duplicate entries",
+      "expected_route": "triage"
+    },
+    {
+      "id": "evolve-triage-ticket-classify",
+      "prompt": "Classify these support tickets into severity buckets",
+      "expected_route": "triage"
+    },
+    {
+      "id": "evolve-vision-screenshot-layout",
+      "prompt": "Inspect this screenshot of the login page and describe the layout",
+      "expected_route": "vision"
+    },
+    {
+      "id": "evolve-vision-diagram-visual",
+      "prompt": "Inspect this diagram of the pipeline and mark the broken visual step",
+      "expected_route": "vision"
+    },
+    {
+      "id": "evolve-context-incident-transcript",
+      "prompt": "Read this long transcript of the incident call and produce a digest",
+      "expected_route": "context"
+    },
+    {
+      "id": "evolve-freereason-batching-tradeoff",
+      "prompt": "Analyze the tradeoff between batching and streaming in this design",
+      "expected_route": "free-reason"
+    },
+    {
+      "id": "evolve-reason-security-audit",
+      "prompt": "Audit the parser for security issues and propose a hardening plan",
+      "expected_route": "reason"
+    },
+    {
+      "id": "evolve-reason-architecture-review",
+      "prompt": "Review the architecture of the event bus and prove it has no race conditions",
+      "expected_route": "reason"
+    },
+    {
+      "id": "evolve-refactor-modular-launcher",
+      "prompt": "Refactor and restructure the launcher so related helpers live in one module",
+      "expected_route": "refactor"
+    },
+    {
+      "id": "evolve-refactor-rename-config-loader",
+      "prompt": "Rename the config loader and clean up its multi-file imports",
+      "expected_route": "refactor"
+    },
+    {
+      "id": "evolve-fastcode-python-snippet",
+      "prompt": "Give me a quick python snippet that flips a string in place",
+      "expected_route": "fast-code"
+    },
+    {
+      "id": "evolve-code-download-bugfix",
+      "prompt": "Implement a fix for the failing bug in the download script",
+      "expected_route": "code"
+    },
+    {
+      "id": "evolve-code-bash-branch",
+      "prompt": "Write a bash script that prints the git branch name",
+      "expected_route": "code"
+    },
+    {
+      "id": "evolve-explicit-local-greeting",
+      "prompt": "@local Draft a short greeting using the local server",
+      "expected_route": "local",
+      "forbidden_routes": ["ollama", "premium"]
+    },
+    {
+      "id": "evolve-explicit-ollama-story",
+      "prompt": "@ollama Tell me a bedtime story about a robot",
+      "expected_route": "ollama",
+      "forbidden_routes": ["local", "premium"]
+    },
+    {
+      "id": "evolve-explicit-premium-summary",
+      "prompt": "@premium Draft the executive summary section",
+      "expected_route": "premium",
+      "forbidden_routes": ["local", "ollama"]
+    },
+    {
+      "id": "evolve-default-no-keyword",
+      "prompt": "Handle this request end to end",
+      "expected_route": "code",
+      "forbidden_routes": ["local", "ollama", "premium"]
+    },
+    {
+      "id": "evolve-guard-premium-word",
+      "prompt": "Run this on the premium model please",
+      "expected_route": "code",
+      "forbidden_routes": ["local", "ollama", "premium"]
+    }
+  ],
+  "held_out_tasks": [
+    {
+      "id": "held-triage-summarize-changes",
+      "prompt": "Summarize the key points of this change list",
+      "expected_route": "triage"
+    },
+    {
+      "id": "held-triage-filter-warnings",
+      "prompt": "Filter the warnings out of this stream",
+      "expected_route": "triage"
+    },
+    {
+      "id": "held-vision-ui-mockup",
+      "prompt": "Check this UI mockup image for overlapping labels",
+      "expected_route": "vision"
+    },
+    {
+      "id": "held-context-long-document",
+      "prompt": "Digest this long document about the release process",
+      "expected_route": "context"
+    },
+    {
+      "id": "held-freereason-compare-options",
+      "prompt": "Evaluate the options and compare their maintenance cost",
+      "expected_route": "free-reason"
+    },
+    {
+      "id": "held-reason-spec-plan",
+      "prompt": "Plan the migration path and keep the spec in sync",
+      "expected_route": "reason"
+    },
+    {
+      "id": "held-refactor-restructure-docs",
+      "prompt": "Restructure the docs folder layout",
+      "expected_route": "refactor"
+    },
+    {
+      "id": "held-fastcode-boilerplate",
+      "prompt": "Draft quick boilerplate for a config parser",
+      "expected_route": "fast-code"
+    },
+    {
+      "id": "held-code-widget-bugfix",
+      "prompt": "Implement the export widget and fix its rounding bug",
+      "expected_route": "code"
+    },
+    {
+      "id": "held-explicit-local-haiku",
+      "prompt": "@local Write a haiku about databases",
+      "expected_route": "local",
+      "forbidden_routes": ["ollama", "premium"]
+    },
+    {
+      "id": "held-explicit-ollama-riddle",
+      "prompt": "@ollama Answer the riddle about the two doors",
+      "expected_route": "ollama",
+      "forbidden_routes": ["local", "premium"]
+    },
+    {
+      "id": "held-guard-local-word",
+      "prompt": "Use the local model for this one",
+      "expected_route": "code",
+      "forbidden_routes": ["local", "ollama", "premium"]
+    },
+    {
+      "id": "held-guard-ollama-word",
+      "prompt": "Check whether the local ollama service is up",
+      "expected_route": "code",
+      "forbidden_routes": ["local", "ollama", "premium"]
+    },
+    {
+      "id": "held-explicit-premium-note",
+      "prompt": "@premium Polish this note for the board",
+      "expected_route": "premium",
+      "forbidden_routes": ["local", "ollama"]
+    }
+  ]
+}

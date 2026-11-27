@@ -1,0 +1,212 @@
+/* Nexus TUI — skeletal 0-gap terminal layout.
+   Colours come from the active Textual theme (nexus-charcoal by default), so
+   this sheet stays valid under every theme in nexus/tui/themes.py. */
+
+Screen {
+    layout: vertical;
+    background: $background;
+    color: $text;
+}
+
+#tab-bar {
+    dock: top;
+    height: 2;
+    background: $surface;
+    border-bottom: solid $border;
+    layout: horizontal;
+    padding: 0 1;
+}
+
+#workspace {
+    height: 1fr;
+    width: 1fr;
+    layout: horizontal;
+}
+
+#main-pane {
+    width: 1fr;
+    height: 1fr;
+    layout: vertical;
+}
+
+#transcript {
+    height: 1fr;
+    padding: 0 2 1 2;
+    scrollbar-size: 1 1;
+}
+
+#home-hero {
+    width: 1fr;
+    height: auto;
+    align: center middle;
+    margin: 2 4;
+    padding: 1 2;
+    background: $surface;
+    border: solid $border;
+}
+
+#sidebar {
+    width: 44;
+    dock: right;
+    height: 1fr;
+    background: $surface;
+    border-left: solid $border;
+    padding: 0 1;
+}
+
+#sidebar.hidden {
+    display: none;
+}
+
+.user-card {
+    height: auto;
+    background: $panel;
+    border-left: thick $primary;
+    padding: 0 1;
+    margin: 1 0 0 0;
+}
+
+.routing-pill {
+    height: auto;
+    color: $text-muted;
+    padding: 0 1;
+    margin: 0;
+}
+
+.tool-group {
+    height: auto;
+    background: $surface;
+    border-top: none;
+    border-left: solid $secondary;
+    margin: 0 0 0 1;
+    padding: 0 1;
+}
+
+.assistant-card {
+    height: auto;
+    padding: 0 1 1 1;
+    margin: 0;
+}
+
+.assistant-card.tier-premium {
+    border-left: thick $error;
+    background: $surface;
+}
+
+.assistant-receipt {
+    height: auto;
+    color: $text-muted;
+    margin-top: 1;
+    layout: horizontal;
+}
+
+.system-note {
+    height: auto;
+    background: $surface;
+    border-left: solid $secondary;
+    margin: 1 0;
+    padding: 0 1;
+    color: $text;
+}
+
+.council-grid {
+    height: auto;
+    layout: grid;
+    grid-size: 3;
+    grid-gutter: 1;
+    margin: 1 0;
+}
+
+.council-grid.stacked {
+    grid-size: 1;
+}
+
+.council-seat {
+    height: 100%;
+    background: $surface;
+    border: solid $border;
+    padding: 0 1;
+}
+
+.council-grid.stacked .council-seat {
+    height: auto;
+}
+
+#suggestion-popup {
+    height: auto;
+    max-height: 10;
+    margin: 0 2;
+    background: $panel;
+    border: solid $primary;
+    padding: 0 1;
+    display: none;
+}
+
+#suggestion-popup.visible {
+    display: block;
+}
+
+#composer-container {
+    height: auto;
+    max-height: 11;
+    margin: 0 2 0 2;
+    background: $surface;
+    border: solid $border;
+    border-left: thick $accent;
+    padding: 0 1;
+}
+
+#composer-container:focus-within {
+    border: solid $primary;
+    border-left: thick $accent;
+}
+
+#composer-container.tier-go {
+    border-left: thick $primary;
+}
+
+#composer-container.tier-local {
+    border-left: thick #60a5fa;
+}
+
+#composer-container.tier-premium {
+    border-left: thick $error;
+}
+
+#composer-input {
+    height: auto;
+    min-height: 1;
+    max-height: 6;
+    border: none;
+    background: transparent;
+    padding: 0;
+}
+
+#composer-meta {
+    height: 1;
+    layout: horizontal;
+    color: $text-muted;
+}
+
+#hint-footer {
+    dock: bottom;
+    height: 1;
+    background: $footer-background;
+    color: $footer-foreground;
+    padding: 0 2;
+}
+
+ModalScreen {
+    align: center middle;
+    background: $background 65%;
+}
+
+.modal-dialog {
+    width: 74;
+    max-width: 92%;
+    height: auto;
+    max-height: 82%;
+    background: $surface;
+    border: solid $primary;
+    padding: 1 2;
+}

@@ -1,0 +1,54 @@
+{
+  "name": "local-only",
+  "description": "100% offline local routing (@ollama + @local OpenAI-compat)",
+  "mode": "entity",
+  "system_persona": "You are Nexus, a unified AI engineering assistant. Respond directly in one cohesive, authoritative voice. Never expose internal model routing, dispatch mechanics, or ask the user to manually switch models. Continue the conversation seamlessly using any shared context provided. Continuously look for concrete, measurable ways to improve accuracy, latency, and open-model efficiency without over-engineering.",
+  "handoff_max_turns": 8,
+  "handoff_max_chars": 6000,
+  "replace_routes": true,
+  "default_route": "ollama",
+  "routes": {
+    "local": {
+      "backend": "openai-compat",
+      "model": "local-model",
+      "endpoint": "http://127.0.0.1:8000/v1/chat/completions",
+      "quota_tier": "LOCAL",
+      "timeout_s": 120,
+      "explicit_only": false,
+      "keywords": [
+        "quick",
+        "snippet",
+        "one-liner",
+        "triage",
+        "summarize",
+        "fast"
+      ],
+      "description": "Local OpenAI-compatible HTTP server for fast tasks"
+    },
+    "ollama": {
+      "backend": "ollama",
+      "model": "llama3.2:latest",
+      "endpoint": "http://127.0.0.1:11434/api/chat",
+      "quota_tier": "LOCAL",
+      "think": "medium",
+      "timeout_s": 300,
+      "explicit_only": false,
+      "keywords": [
+        "reason",
+        "audit",
+        "spec",
+        "architecture",
+        "review",
+        "code",
+        "implement",
+        "write",
+        "fix"
+      ],
+      "description": "Local Ollama HTTP server for coding and reasoning"
+    }
+  },
+  "precedence": [
+    "local",
+    "ollama"
+  ]
+}

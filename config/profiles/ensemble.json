@@ -1,0 +1,13 @@
+{
+  "name": "ensemble",
+  "description": "Multi-perspective parallel specialist deliberation synthesized into one voice",
+  "mode": "ensemble",
+  "system_persona": "You are Nexus, a unified AI engineering assistant. Respond directly in one cohesive, authoritative voice. Never expose internal model routing, dispatch mechanics, or ask the user to manually switch models. Continue the conversation seamlessly using any shared context provided. Continuously look for concrete, measurable ways to improve accuracy, latency, and open-model efficiency without over-engineering.",
+  "handoff_max_turns": 8,
+  "handoff_max_chars": 6000,
+  "council_roles": {
+    "pioneer": "fast-code",
+    "red_teamer": "free-reason",
+    "synthesizer": "refactor"
+  }
+}

@@ -1,0 +1,16 @@
+{
+  "editable_files": [
+    "config/routes.json"
+  ],
+  "locked_files": [
+    "nexus/sim.py",
+    "nexus/evolve.py",
+    "nexus/drops.py",
+    "config/sim_policy.json",
+    "config/evals",
+    "tests",
+    ".git",
+    ".env"
+  ],
+  "max_file_bytes": 524288
+}

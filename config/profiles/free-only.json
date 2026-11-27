@@ -1,0 +1,26 @@
+{
+  "name": "free-only",
+  "description": "100% zero-cost cloud specialist routing ($0)",
+  "mode": "entity",
+  "system_persona": "You are Nexus, a unified AI engineering assistant. Respond directly in one cohesive, authoritative voice. Never expose internal model routing, dispatch mechanics, or ask the user to manually switch models. Continue the conversation seamlessly using any shared context provided. Continuously look for concrete, measurable ways to improve accuracy, latency, and open-model efficiency without over-engineering.",
+  "handoff_max_turns": 8,
+  "handoff_max_chars": 6000,
+  "routes": {
+    "refactor": {
+      "model": "opencode/deepseek-v4.1-flash-free",
+      "quota_tier": "FREE",
+      "description": "Multi-file restructuring on zero-cost tier"
+    },
+    "reason": {
+      "model": "opencode/flint-40b-free",
+      "fallback": "opencode/hy4-flash-free",
+      "quota_tier": "FREE",
+      "description": "Deep reasoning, specs, audits and reviews on zero-cost tier"
+    },
+    "context": {
+      "model": "opencode/hy4-flash-free",
+      "quota_tier": "FREE",
+      "description": "Long-context synthesis on zero-cost tier"
+    }
+  }
+}

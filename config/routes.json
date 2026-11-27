@@ -1,0 +1,187 @@
+{
+  "default_route": "code",
+  "decision_model": "opencode/nemotron-3.5-lightning-free",
+  "council_roles": {
+    "pioneer": "fast-code",
+    "red_teamer": "free-reason",
+    "synthesizer": "refactor"
+  },
+  "routes": {
+    "triage": {
+      "backend": "opencode",
+      "model": "opencode/nemotron-3.5-lightning-free",
+      "quota_tier": "FREE",
+      "timeout_s": 60,
+      "keywords": [
+        "triage",
+        "filter",
+        "summarize",
+        "classify"
+      ],
+      "description": "Fast log/diff triage and classification"
+    },
+    "code": {
+      "backend": "opencode",
+      "model": "opencode/deepseek-v4.1-flash-free",
+      "fallback": "opencode-go/deepseek-v4.1-flash",
+      "quota_tier": "FREE",
+      "timeout_s": 300,
+      "keywords": [
+        "code",
+        "implement",
+        "write",
+        "script",
+        "fix",
+        "bug",
+        "bash",
+        "python"
+      ],
+      "description": "Default implementation and shell work",
+      "principle": "Default for new implementation work in an existing codebase; one file or a small set."
+    },
+    "fast-code": {
+      "backend": "opencode",
+      "model": "opencode/mimo-v2.6-flash-free",
+      "quota_tier": "FREE",
+      "timeout_s": 90,
+      "keywords": [
+        "quick",
+        "snippet",
+        "one-liner",
+        "boilerplate",
+        "fast"
+      ],
+      "description": "Small snippets and boilerplate",
+      "principle": "Single snippet, one-liner, or boilerplate; no surrounding context needed."
+    },
+    "refactor": {
+      "backend": "opencode",
+      "model": "opencode-go/kimi-k3.1-pro",
+      "fallback": "opencode-go/qwen4-max",
+      "quota_tier": "GO",
+      "timeout_s": 300,
+      "keywords": [
+        "refactor",
+        "restructure",
+        "rename",
+        "clean",
+        "modularize",
+        "multi-file"
+      ],
+      "description": "Multi-file restructuring and code surgery",
+      "principle": "Multi-file restructuring, renames, or modularisation where call sites must move too."
+    },
+    "reason": {
+      "backend": "opencode",
+      "model": "opencode-go/glm-5.3",
+      "fallback": "opencode-go/qwen4-max",
+      "quota_tier": "GO",
+      "timeout_s": 300,
+      "keywords": [
+        "reason",
+        "audit",
+        "security",
+        "spec",
+        "plan",
+        "prove",
+        "architecture",
+        "review",
+        "reverse"
+      ],
+      "description": "Deep reasoning, specs, audits and reviews"
+    },
+    "free-reason": {
+      "backend": "opencode",
+      "model": "opencode/flint-40b-free",
+      "fallback": "opencode/hy4-flash-free",
+      "quota_tier": "FREE",
+      "timeout_s": 150,
+      "keywords": [
+        "analyze",
+        "evaluate",
+        "compare",
+        "tradeoff"
+      ],
+      "description": "Free-tier reasoning and trade-off analysis"
+    },
+    "context": {
+      "backend": "opencode",
+      "model": "opencode-go/minimax-m3.1-flash",
+      "fallback": "opencode/hy4-flash-free",
+      "quota_tier": "GO",
+      "timeout_s": 120,
+      "keywords": [
+        "long",
+        "document",
+        "log",
+        "transcript",
+        "digest",
+        "read"
+      ],
+      "description": "Long-context synthesis over documents and logs"
+    },
+    "vision": {
+      "backend": "opencode",
+      "model": "opencode/nemotron-3.5-super-vl-free",
+      "quota_tier": "FREE",
+      "timeout_s": 120,
+      "keywords": [
+        "image",
+        "screenshot",
+        "vision",
+        "ui",
+        "diagram",
+        "visual"
+      ],
+      "description": "Screenshot, PDF and UI inspection"
+    },
+    "local": {
+      "backend": "openai-compat",
+      "model": "local-model",
+      "endpoint": "http://127.0.0.1:8000/v1/chat/completions",
+      "quota_tier": "LOCAL",
+      "timeout_s": 120,
+      "explicit_only": true,
+      "keywords": [],
+      "description": "Explicit @local only (local OpenAI-compatible HTTP server)"
+    },
+    "ollama": {
+      "backend": "ollama",
+      "model": "llama3.2:latest",
+      "endpoint": "http://127.0.0.1:11434/api/chat",
+      "quota_tier": "LOCAL",
+      "think": "medium",
+      "timeout_s": 300,
+      "explicit_only": true,
+      "keywords": [],
+      "description": "Explicit @ollama only (local Ollama HTTP server)"
+    },
+    "premium": {
+      "backend": "agy",
+      "model": "premium-cli",
+      "quota_tier": "PREMIUM",
+      "timeout_s": 240,
+      "explicit_only": true,
+      "keywords": [],
+      "description": "Explicit @premium only (optional external CLI backend)"
+    }
+  },
+  "budgets": {
+    "max_spans_per_trace": 32,
+    "max_children": 8,
+    "max_depth": 2
+  },
+  "precedence": [
+    "triage",
+    "vision",
+    "context",
+    "free-reason",
+    "reason",
+    "refactor",
+    "fast-code",
+    "code",
+    "local",
+    "ollama",
+    "premium"
+  ]
+}

@@ -1,0 +1,2654 @@
+#!/usr/bin/env python3
+"""Nexus CLI — Front-Facing Free Decision Model & Multi-Orchestrator Handoff Console."""
+
+from __future__ import annotations
+
+import argparse
+from concurrent.futures import ThreadPoolExecutor
+import json
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import tempfile
+import textwrap
+import threading
+import time
+from typing import Optional
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from nexus.backends import ExecutionResult, execute_route
+from nexus.drops import save_text_artifact
+from nexus.entity import (
+    DEFAULT_PROFILE_NAME,
+    EntityProfile,
+    benchmark_profiles,
+    build_handoff_context,
+    build_synthesis_prompt,
+    compute_performance_stats,
+    list_profiles,
+    load_profile,
+    render_bench_table,
+    render_stats_table,
+    resolve_profile_routes,
+    save_user_profile,
+)
+from nexus.events import (
+    DEFAULT_EVENTS_PATH,
+    emit_event,
+    new_span_id,
+    new_trace_id,
+    prune_events,
+    read_events,
+)
+from nexus.router import (
+    DEFAULT_DECISION_MODEL,
+    OrchestratorDecision,
+    budget_allows,
+    front_desk_decide,
+    load_budgets,
+    load_routes,
+    probe_local_endpoints,
+    validate_routes,
+)
+from nexus.sessions import DEFAULT_SESSIONS_PATH, load_sessions
+from nexus.sim import (
+    carry_forward,
+    compact_sim,
+    format_sim_for_prompt,
+    load_sim,
+    merge_problems,
+    new_ledger,
+    render_sim_summary,
+    resolve_sim_path,
+    save_sim,
+    validate_sim,
+)
+from nexus.square import (
+    DEFAULT_BOARD_PATH,
+    DEFAULT_SQUARE_PATH,
+    post_square,
+    read_board,
+    read_square,
+    render_square_view,
+    write_board,
+)
+from nexus.visualizer import (
+    format_duration,
+    format_quota_badge,
+    format_tokens,
+    pad_ansi,
+    render_delegation_tree,
+    render_panel,
+    render_routes_table,
+    status_line,
+    visible_len,
+    watch_events,
+)
+
+# Verbosity levels: 0 = quiet (answer + errors only), 1 = default, 2 = verbose.
+VERBOSITY_QUIET = 0
+VERBOSITY_DEFAULT = 1
+VERBOSITY_VERBOSE = 2
+
+THINK_LEVELS = ("off", "low", "medium", "high")
+
+
+def _log(text: str, *, verbosity: int, minimum: int = 1) -> None:
+    """Write a status line to stderr when the current verbosity allows it."""
+    if verbosity >= minimum:
+        print(text, file=sys.stderr)
+
+
+def _print_live_tree(
+    trace_id: str, events_path: Path, color: bool = True, *, verbosity: int = VERBOSITY_DEFAULT
+) -> None:
+    if verbosity < 1:
+        return
+    evs = read_events(path=events_path, trace_id=trace_id)
+    tree_str = render_delegation_tree(evs, trace_id=trace_id, color=color)
+    sys.stderr.write(tree_str + "\n")
+    sys.stderr.flush()
+
+
+def cmd_routes(args: argparse.Namespace) -> int:
+    routes_data = load_routes()
+    routes = routes_data.get("routes", {})
+    color = not getattr(args, "no_color", False)
+
+    # --quiet: one line only when the pins are broken, else silence. This is the
+    # form the SessionStart hook calls, so a healthy table never costs context.
+    if getattr(args, "quiet", False):
+        ok, errors = validate_routes(
+            routes_data,
+            refresh_cache=getattr(args, "refresh", False),
+            check_local=getattr(args, "local", False),
+        )
+        if ok:
+            return 0
+        print(f"NEXUS | {len(errors)} route pin problem(s) (run 'nexus routes --validate')")
+        return 1
+
+    print(render_routes_table(routes_data, color=color))
+
+    if args.validate:
+        ok, errors = validate_routes(
+            routes_data,
+            refresh_cache=True,
+            check_local=getattr(args, "local", False),
+        )
+        if ok:
+            print(f"ROUTES_AUDIT | PASS ({len(routes)}/{len(routes)} specialist pins verified)")
+            return 0
+        print(f"ROUTES_AUDIT | FAIL ({len(errors)} error(s)):", file=sys.stderr)
+        for err in errors:
+            print(f"  ✗ {err}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def cmd_square(args: argparse.Namespace) -> int:
+    square_path: Path = getattr(args, "square_file", DEFAULT_SQUARE_PATH)
+    board_path: Path = getattr(args, "board_file", DEFAULT_BOARD_PATH)
+
+    if getattr(args, "digest", False):
+        posts = read_square(limit=1, square_path=square_path)
+        board = read_board(board_path=board_path)
+        if not posts and not board:
+            return 0
+        latest = posts[-1] if posts else {}
+        latest_str = f"last: ({latest.get('author')}/{latest.get('model')}) {str(latest.get('body', ''))[:60]}" if latest else "no posts"
+        board_lines = [l.strip() for l in board.splitlines() if l.strip() and not l.strip().startswith("<!--")]
+        board_str = board_lines[0][:50] if board_lines else "empty"
+        print(f"SQUARE | board: {board_str} | {latest_str}")
+        return 0
+
+    action = getattr(args, "square_action", None) or "read"
+    if action == "post":
+        msg = " ".join(getattr(args, "message", []) or []).strip()
+        if not msg:
+            print("nexus square post: message required", file=sys.stderr)
+            return 2
+        rec = post_square(
+            msg,
+            author=getattr(args, "author", "cli"),
+            model=getattr(args, "model", "manual"),
+            tag=getattr(args, "tag", "note"),
+            verified=bool(getattr(args, "verified", False)),
+            square_path=square_path,
+        )
+        print(f"SQUARE_POST | {rec['id']} posted by {rec['author']} ({rec['model']}) [#{rec['tag']}]")
+        return 0
+
+    if action == "board":
+        text_parts = getattr(args, "content", []) or []
+        if not text_parts:
+            b_txt = read_board(board_path=board_path)
+            print(b_txt if b_txt else "(BOARD.md is empty)")
+            return 0
+        joined = " ".join(text_parts).strip()
+        if joined.lower() == "clear":
+            write_board("", author=getattr(args, "author", "cli"), board_path=board_path)
+            print("SQUARE_BOARD | cleared")
+            return 0
+        write_board(joined, author=getattr(args, "author", "cli"), board_path=board_path)
+        print(f"SQUARE_BOARD | updated ({len(joined)} chars)")
+        return 0
+
+    print(
+        render_square_view(
+            limit=getattr(args, "limit", 10),
+            tag=getattr(args, "tag", None),
+            square_path=square_path,
+            board_path=board_path,
+        )
+    )
+    return 0
+
+
+def _file_line_count(path: Path) -> int:
+    try:
+        return sum(1 for line in path.read_text(encoding="utf-8", errors="replace").splitlines() if line.strip())
+    except OSError:
+        return 0
+
+
+def _file_size(path: Path) -> int:
+    try:
+        return path.stat().st_size
+    except OSError:
+        return 0
+
+
+def cmd_doctor(args: argparse.Namespace) -> int:
+    """Audit harness binaries, route pins, local endpoints, and Nexus state files."""
+    color = not getattr(args, "no_color", False)
+    quiet = getattr(args, "quiet", False)
+    events_path = Path(getattr(args, "events_file", DEFAULT_EVENTS_PATH))
+
+    def say(text: str = "") -> None:
+        if not quiet:
+            print(text)
+
+    ok = True
+    say("NEXUS DOCTOR | environment audit")
+
+    binaries = {name: shutil.which(name) for name in ("opencode", "agy")}
+    for name, path in binaries.items():
+        if path:
+            say(f"  ✓ {name}: {path}")
+        elif name == "agy":
+            say("  · agy: not installed (optional external CLI)")
+        else:
+            say(f"  ✗ {name}: not found on PATH")
+    if not binaries["opencode"]:
+        ok = False
+
+    routes_data = load_routes()
+    routes = routes_data.get("routes", {})
+    validated, errors = validate_routes(routes_data, refresh_cache=True)
+    pinned = sum(1 for cfg in routes.values() if cfg.get("backend", "opencode") == "opencode")
+    if validated:
+        say(f"  ✓ routes: {pinned}/{pinned} verified · {len(routes)} route(s) configured")
+    else:
+        ok = False
+        say(f"  ✗ routes: {len(errors)} pin problem(s)")
+        for err in errors:
+            say(f"    ✗ {err}")
+
+    local = probe_local_endpoints(routes_data)
+    if not local:
+        say("  ◆ local endpoints: none configured")
+    for key, info in local.items():
+        online = bool(info.get("reachable"))
+        state = "ONLINE" if online else "OFFLINE"
+        present = "yes" if info.get("model_present") else "no"
+        say(
+            f"  {'✓' if online else '!'} @{key} [{state}] {info.get('backend')} {info.get('endpoint')}"
+            f" · {info.get('model')} · model_present={present}"
+        )
+        if not online and info.get("detail"):
+            say(f"    detail: {info['detail']}")
+
+    sessions = load_sessions(DEFAULT_SESSIONS_PATH)
+    state_files = [
+        ("events", events_path, f"{_file_line_count(events_path)} line(s)"),
+        ("sessions", DEFAULT_SESSIONS_PATH, f"{len(sessions)} session(s)"),
+        ("board", DEFAULT_BOARD_PATH, f"{_file_line_count(DEFAULT_BOARD_PATH)} line(s)"),
+        ("square", DEFAULT_SQUARE_PATH, f"{_file_line_count(DEFAULT_SQUARE_PATH)} line(s)"),
+    ]
+    for label, path, detail in state_files:
+        marker = "✓" if path.exists() else "·"
+        say(f"  {marker} {label}: {path} ({detail}, {_file_size(path)} bytes)")
+
+    sim_path = resolve_sim_path(getattr(args, "sim", None))
+    if sim_path.exists():
+        try:
+            sim_ledger = load_sim(sim_path, strict=True)
+        except (OSError, ValueError) as exc:
+            say(f"  ✗ sim: {sim_path} (unreadable: {exc})")
+        else:
+            sim_ok, sim_errors = validate_sim(sim_ledger)
+            sim_problems = sim_ledger.get("problems") or []
+            say(
+                f"  {'✓' if sim_ok else '✗'} sim: {sim_path} "
+                f"({len(sim_problems)} problem(s), valid={sim_ok})"
+            )
+            if not sim_ok:
+                for err in sim_errors:
+                    say(f"    ✗ {err}")
+    else:
+        say(f"  · sim: {sim_path} (not initialized)")
+
+    if getattr(args, "prune_events", False):
+        before, after = prune_events(
+            path=events_path,
+            keep_lines=max(1, getattr(args, "keep_lines", 2000)),
+        )
+        say(f"  ✓ events pruned: {before} -> {after} lines")
+
+    if not quiet:
+        try:
+            from nexus.evolve import detect_improvement_opportunities
+
+            tail_events = read_events(path=events_path, limit=500)
+            sim_for_opps = load_sim(sim_path) if sim_path.exists() else None
+            opps = detect_improvement_opportunities(
+                tail_events, ledger=sim_for_opps, routes_data=routes_data
+            )
+            actionable = [o for o in opps if o.get("priority") in ("high", "medium")]
+            if actionable:
+                say(f"  ! improve: {len(actionable)} opportunity(ies) — run 'nexus evolve suggest'")
+        except Exception:
+            pass
+
+    say(status_line("ok" if ok else "fail", "doctor PASS" if ok else "doctor FAIL", color=color))
+    return 0 if ok else 1
+
+
+def cmd_sim(args: argparse.Namespace) -> int:
+    """Inspect and maintain the Self-Improvement Memory (SIM) ledger."""
+    color = not getattr(args, "no_color", False)
+    action = getattr(args, "sim_action", None) or "show"
+    sim_path = resolve_sim_path(getattr(args, "sim", None))
+
+    if action == "show":
+        ledger = load_sim(sim_path)
+        if getattr(args, "json", False):
+            print(format_sim_for_prompt(ledger))
+        else:
+            print(render_sim_summary(ledger, color=color))
+        return 0
+
+    if action == "init":
+        if sim_path.exists() and not getattr(args, "force", False):
+            print(
+                f"nexus: SIM ledger already exists at {sim_path} (use --force to overwrite)",
+                file=sys.stderr,
+            )
+            return 1
+        ledger = new_ledger(
+            domain=str(getattr(args, "domain", "nexus") or "nexus"),
+            policy_model=str(getattr(args, "policy_model", "") or ""),
+            benchmark=str(getattr(args, "benchmark", "") or ""),
+        )
+        save_sim(ledger, sim_path)
+        print(status_line("ok", f"initialized SIM ledger -> {sim_path}", color=color))
+        return 0
+
+    if action == "carry":
+        src_path = Path(getattr(args, "from_file"))
+        try:
+            source = load_sim(src_path, strict=True)
+        except (OSError, ValueError) as exc:
+            print(f"nexus: sim carry: {exc}", file=sys.stderr)
+            return 1
+        carried = carry_forward(
+            source,
+            from_run=str(getattr(args, "from_run")),
+            into_run=str(getattr(args, "into_run")),
+        )
+        save_sim(carried, sim_path)
+        print(
+            status_line(
+                "ok",
+                f"carried {getattr(args, 'from_run')} -> {getattr(args, 'into_run')} · saved {sim_path}",
+                color=color,
+            )
+        )
+        return 0
+
+    if action == "merge":
+        try:
+            ledger = load_sim(sim_path, strict=sim_path.exists())
+            merged = merge_problems(ledger, str(args.source_id), str(args.target_id))
+        except (OSError, ValueError) as exc:
+            print(f"nexus: sim merge: {exc}", file=sys.stderr)
+            return 1
+        save_sim(ledger, sim_path)
+        print(
+            status_line(
+                "ok",
+                f"merged {args.source_id} -> {args.target_id} "
+                f"({len(merged.get('attempts') or [])} attempt(s)) · saved {sim_path}",
+                color=color,
+            )
+        )
+        return 0
+
+    if action == "compact":
+        try:
+            ledger = load_sim(sim_path, strict=sim_path.exists())
+        except (OSError, ValueError) as exc:
+            print(f"nexus: sim compact: {exc}", file=sys.stderr)
+            return 1
+        compacted, archive = compact_sim(
+            ledger,
+            archive_dir=getattr(args, "archive_dir", None),
+            keep_recent_attempts=max(1, int(getattr(args, "keep", 3))),
+        )
+        save_sim(compacted, sim_path)
+        print(
+            status_line(
+                "ok",
+                f"compacted SIM ledger -> {sim_path} "
+                f"({len(compacted.get('problems') or [])} problem(s))",
+                color=color,
+            )
+        )
+        if archive is not None:
+            print(status_line("info", f"archived previous ledger -> {archive}", color=color))
+        return 0
+
+    if action == "validate":
+        if not sim_path.exists():
+            print(f"nexus: sim validate: no ledger at {sim_path}", file=sys.stderr)
+            return 1
+        try:
+            ledger = load_sim(sim_path, strict=True)
+        except (OSError, ValueError) as exc:
+            print("SIM_AUDIT | FAIL", file=sys.stderr)
+            print(f"  ✗ {exc}", file=sys.stderr)
+            return 1
+        ok_sim, problems = validate_sim(ledger)
+        if ok_sim:
+            print(f"SIM_AUDIT | PASS ({len(problems)} problem(s))")
+            return 0
+        print(f"SIM_AUDIT | FAIL ({len(problems)} problem(s))", file=sys.stderr)
+        for err in problems:
+            print(f"  ✗ {err}", file=sys.stderr)
+        return 1
+
+    print(f"nexus: unknown sim action '{action}'", file=sys.stderr)
+    return 2
+
+
+def cmd_evolve(args: argparse.Namespace) -> int:
+    """Run the CRSI evolve loop, evaluate a split, suggest wins, or run cold-start."""
+    # Imported lazily so `nexus --help`, `nexus sim ...` and `nexus doctor` work even
+    # while nexus/evolve.py is mid-write or unavailable.
+    from nexus.evolve import (
+        BenchmarkSpec,
+        ScopePolicy,
+        detect_improvement_opportunities,
+        evaluate_split,
+        normalize_objective,
+        render_improvement_opportunities,
+        run_cold_start_challenger,
+        run_evolve_loop,
+    )
+
+    color = not getattr(args, "no_color", False)
+    verbosity = VERBOSITY_QUIET if getattr(args, "quiet", False) else VERBOSITY_DEFAULT
+    if getattr(args, "verbose", False):
+        verbosity = VERBOSITY_VERBOSE
+
+    action = getattr(args, "evolve_action", None) or "run"
+    workspace = Path(getattr(args, "workspace", None) or PROJECT_ROOT)
+    sim_path = resolve_sim_path(getattr(args, "sim", None))
+    benchmark_arg = getattr(args, "benchmark", None)
+    benchmark_path = Path(benchmark_arg) if benchmark_arg else None
+    policy_arg = getattr(args, "policy_file", None)
+    policy_routes = getattr(args, "policy_routes", None)
+    dry_run = bool(getattr(args, "dry_run", False))
+    events_path = Path(getattr(args, "events_file", DEFAULT_EVENTS_PATH))
+    scope_arg = getattr(args, "scope", None)
+    try:
+        objective = normalize_objective(getattr(args, "objective", "balanced"))
+    except ValueError as exc:
+        print(f"nexus: evolve: {exc}", file=sys.stderr)
+        return 2
+
+    if action == "suggest":
+        events = read_events(path=events_path, limit=1000)
+        ledger_opt = load_sim(sim_path) if sim_path.exists() else None
+        opps = detect_improvement_opportunities(
+            events, ledger=ledger_opt, routes_data=load_routes()
+        )
+        if getattr(args, "json", False):
+            print(json.dumps(opps, indent=2, ensure_ascii=False))
+            return 0
+        width = max(72, min(116, shutil.get_terminal_size(fallback=(96, 30)).columns))
+        print(render_improvement_opportunities(opps, color=color, width=width))
+        return 0
+
+    try:
+        spec = BenchmarkSpec.load(benchmark_path)
+    except (OSError, ValueError) as exc:
+        print(f"nexus: evolve: {exc}", file=sys.stderr)
+        return 1
+
+    if action == "eval":
+        split = str(getattr(args, "split", "evolve") or "evolve").replace("-", "_")
+        if split not in ("evolve", "held_out"):
+            print(f"nexus: evolve eval: unknown split '{split}'", file=sys.stderr)
+            return 2
+        profile_name = getattr(args, "profile", None)
+        eval_ws = workspace
+        tmp_profile_dir: Optional[tempfile.TemporaryDirectory[str]] = None
+        if profile_name:
+            try:
+                prof = load_profile(profile_name)
+                base_file = workspace / "config" / "routes.json"
+                base_routes = load_routes(base_file) if base_file.is_file() else load_routes()
+                resolved = resolve_profile_routes(prof, base_routes)
+            except (OSError, ValueError) as exc:
+                print(f"nexus: evolve eval: {exc}", file=sys.stderr)
+                return 1
+            tmp_profile_dir = tempfile.TemporaryDirectory(prefix="nexus-evolve-prof-")
+            eval_ws = Path(tmp_profile_dir.name)
+            if (workspace / "config").is_dir():
+                shutil.copytree(workspace / "config", eval_ws / "config", dirs_exist_ok=True)
+            else:
+                (eval_ws / "config").mkdir(parents=True, exist_ok=True)
+            (eval_ws / "config" / "routes.json").write_text(
+                json.dumps(resolved, indent=2), encoding="utf-8"
+            )
+        try:
+            report = evaluate_split(
+                eval_ws,
+                spec,
+                split=split,
+                policy_routes=policy_routes,
+            )
+        except (OSError, ValueError) as exc:
+            print(f"nexus: evolve eval: {exc}", file=sys.stderr)
+            return 1
+        finally:
+            if tmp_profile_dir is not None:
+                tmp_profile_dir.cleanup()
+        print(
+            f"EVOLVE_EVAL | split={report.split} passed={report.passed}/{report.total} "
+            f"({report.score:.1%})"
+        )
+        if report.passed < report.total:
+            for task_id in report.failing_ids():
+                trace = (report.traces or {}).get(task_id, "no trace")
+                print(f"  ✗ {task_id}: {trace}")
+        if getattr(args, "strict", False) and report.passed < report.total:
+            return 1
+        return 0
+
+    if action == "challenge":
+        seed_arg = getattr(args, "seed_dir", None)
+        if seed_arg is None:
+            print("nexus: evolve challenge: --seed-dir is required", file=sys.stderr)
+            return 2
+        try:
+            inherited = load_sim(sim_path, strict=sim_path.exists())
+        except (OSError, ValueError) as exc:
+            print(f"nexus: evolve challenge: {exc}", file=sys.stderr)
+            return 1
+        _log(
+            status_line(
+                "info",
+                f"cold-start challenge · seed={seed_arg} · sim={sim_path}",
+                color=color,
+            ),
+            verbosity=verbosity,
+        )
+        try:
+            result = run_cold_start_challenger(
+                workspace,
+                Path(seed_arg),
+                spec,
+                inherited,
+                rounds=max(1, int(getattr(args, "rounds", 2))),
+                policy_routes=policy_routes,
+                proposer_route=str(getattr(args, "proposer_route", "refactor") or "refactor"),
+                selector_route=str(getattr(args, "selector_route", "reason") or "reason"),
+                dry_run=dry_run,
+                events_path=events_path,
+            )
+        except (OSError, ValueError) as exc:
+            print(f"nexus: evolve challenge: {exc}", file=sys.stderr)
+            return 1
+        continued = float(result.get("continued_held_out") or 0.0)
+        fresh = float(result.get("fresh_held_out") or 0.0)
+        delta = float(result.get("delta") or 0.0)
+        print(
+            f"COLD_START | continued_held_out={continued:.1%} fresh_held_out={fresh:.1%} "
+            f"delta={delta:+.1%} winner={result.get('winner')}"
+        )
+        recommendation = str(result.get("recommendation") or "").strip()
+        if recommendation:
+            print(f"  {recommendation}")
+        return 0
+
+    # action == "run"
+    try:
+        ledger = load_sim(sim_path, strict=sim_path.exists())
+    except (OSError, ValueError) as exc:
+        print(f"nexus: evolve run: {exc}", file=sys.stderr)
+        return 1
+    try:
+        if policy_arg:
+            policy = ScopePolicy.load(Path(policy_arg))
+        elif scope_arg:
+            policy = ScopePolicy.for_scope(scope_arg)
+        else:
+            policy = ScopePolicy.load()
+    except (OSError, ValueError) as exc:
+        print(f"nexus: evolve run: {exc}", file=sys.stderr)
+        return 1
+
+    apply_changes = bool(getattr(args, "apply", False))
+    profile_name = getattr(args, "profile", None)
+    run_ws = workspace
+    tmp_run_dir: Optional[tempfile.TemporaryDirectory[str]] = None
+    if profile_name:
+        if apply_changes:
+            print("nexus: evolve run: --profile cannot be combined with --apply", file=sys.stderr)
+            return 2
+        try:
+            prof = load_profile(profile_name)
+            base_file = workspace / "config" / "routes.json"
+            base_routes = load_routes(base_file) if base_file.is_file() else load_routes()
+            resolved = resolve_profile_routes(prof, base_routes)
+        except (OSError, ValueError) as exc:
+            print(f"nexus: evolve run: {exc}", file=sys.stderr)
+            return 1
+        tmp_run_dir = tempfile.TemporaryDirectory(prefix="nexus-evolve-run-")
+        run_ws = Path(tmp_run_dir.name)
+        if (workspace / "config").is_dir():
+            shutil.copytree(workspace / "config", run_ws / "config", dirs_exist_ok=True)
+        else:
+            (run_ws / "config").mkdir(parents=True, exist_ok=True)
+        (run_ws / "config" / "routes.json").write_text(
+            json.dumps(resolved, indent=2), encoding="utf-8"
+        )
+
+    rounds = max(1, int(getattr(args, "rounds", 1)))
+    _log(
+        status_line(
+            "info",
+            f"evolve · {rounds} round(s) · k={max(1, int(getattr(args, 'candidates', 2)))}"
+            f" · obj={objective}"
+            + (f" · scope={scope_arg}" if scope_arg else "")
+            + f" · workspace={run_ws} · sim={sim_path}",
+            color=color,
+        ),
+        verbosity=verbosity,
+    )
+    if dry_run:
+        _log(status_line("warn", "dry-run: proposals are synthesized, no backend invoked", color=color), verbosity=verbosity)
+
+    try:
+        result = run_evolve_loop(
+            run_ws,
+            spec,
+            ledger,
+            rounds=rounds,
+            sim_path=sim_path,
+            proposer_route=str(getattr(args, "proposer_route", "refactor") or "refactor"),
+            selector_route=str(getattr(args, "selector_route", "reason") or "reason"),
+            policy_routes=policy_routes,
+            candidates_k=max(1, int(getattr(args, "candidates", 2))),
+            policy=policy,
+            apply_changes=apply_changes,
+            dry_run=dry_run,
+            events_path=events_path,
+            allow_fallback=not bool(getattr(args, "no_fallback", False)),
+            objective=objective,
+        )
+    except (OSError, ValueError) as exc:
+        print(f"nexus: evolve run: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        if tmp_run_dir is not None:
+            tmp_run_dir.cleanup()
+
+    final_ledger = result.get("final_ledger") or ledger
+    save_sim(final_ledger, sim_path)
+
+    summaries = result.get("round_summaries") or []
+    for summary in summaries:
+        if not isinstance(summary, dict):
+            continue
+        baseline = summary.get("baseline") if isinstance(summary.get("baseline"), dict) else {}
+        winner_id = summary.get("winner")
+        candidates = {
+            cand.get("sample"): cand
+            for cand in (summary.get("candidates") or [])
+            if isinstance(cand, dict)
+        }
+        winner = candidates.get(winner_id) or {}
+        base_score = float(baseline.get("score") or 0.0)
+        final_score = winner.get("score")
+        final_text = (
+            f"{int(winner.get('passed') or 0)}/{int(winner.get('total') or 0)} ({float(final_score):.1%})"
+            if final_score is not None
+            else f"{int(baseline.get('passed') or 0)}/{int(baseline.get('total') or 0)} ({base_score:.1%})"
+        )
+        print(
+            f"EVOLVE | round={summary.get('round')} "
+            f"baseline={int(baseline.get('passed') or 0)}/{int(baseline.get('total') or 0)} ({base_score:.1%}) "
+            f"-> final={final_text} · winner={winner_id} "
+            f"· promoted={'yes' if summary.get('promoted') else 'no'} "
+            f"· applied={'yes' if summary.get('applied') else 'no'}"
+        )
+
+    promoted = result.get("promoted_rounds") or []
+    applied = result.get("applied_rounds") or []
+    print(
+        f"EVOLVE | rounds={result.get('rounds_run', len(summaries))} "
+        f"· start_round={result.get('start_round')} · promoted={promoted or 'none'} "
+        f"· applied={applied or 'none'} · sim={sim_path}"
+    )
+    trace_id = str(result.get("trace_id") or "")
+    if trace_id:
+        _print_live_tree(trace_id, events_path, color=color, verbosity=verbosity)
+    print(render_sim_summary(final_ledger, color=color))
+    return 0
+
+
+def cmd_profile(args: argparse.Namespace) -> int:
+    """List, inspect, or initialize Nexus entity configuration profiles."""
+    color = not getattr(args, "no_color", False)
+    action = getattr(args, "profile_action", None) or "list"
+    as_json = bool(getattr(args, "json", False))
+
+    if action == "list":
+        profiles = list_profiles()
+        if as_json:
+            payload = [
+                {
+                    "name": p.name,
+                    "mode": p.mode,
+                    "description": p.description,
+                    "default_route": p.default_route,
+                    "decision_model": p.decision_model,
+                    "source": str(p.source_path) if p.source_path else "",
+                }
+                for p in profiles
+            ]
+            print(json.dumps(payload, indent=2, ensure_ascii=False))
+            return 0
+        width = max(72, min(108, shutil.get_terminal_size(fallback=(96, 30)).columns))
+        lines = [
+            f"{'* ' if p.name == DEFAULT_PROFILE_NAME else '  '}{p.name:<14} [{p.mode:<8}] {p.description}"
+            for p in profiles
+        ]
+        print(
+            render_panel(
+                lines or ["(no profiles found)"],
+                title="NEXUS PROFILES",
+                footer="Use 'nexus profile show <name>' or 'nexus --profile <name> ...'",
+                width=width,
+            )
+        )
+        return 0
+
+    if action == "show":
+        target = getattr(args, "name", None) or DEFAULT_PROFILE_NAME
+        try:
+            prof = load_profile(target)
+        except (OSError, ValueError) as exc:
+            print(f"nexus: profile show: {exc}", file=sys.stderr)
+            return 1
+        resolved = resolve_profile_routes(prof, load_routes())
+        if as_json:
+            payload = {
+                "name": prof.name,
+                "mode": prof.mode,
+                "description": prof.description,
+                "default_route": prof.default_route,
+                "decision_model": prof.decision_model,
+                "council_roles": prof.council_roles,
+                "replace_routes": prof.replace_routes,
+                "handoff_max_turns": prof.handoff_max_turns,
+                "handoff_max_chars": prof.handoff_max_chars,
+                "system_persona": prof.system_persona,
+                "source": str(prof.source_path) if prof.source_path else "",
+                "resolved_routes": resolved,
+            }
+            print(json.dumps(payload, indent=2, ensure_ascii=False))
+            return 0
+        print(
+            f"PROFILE | name={prof.name} mode={prof.mode} "
+            f"default_route={resolved.get('default_route')} "
+            f"decision_model={resolved.get('decision_model')} "
+            f"source={prof.source_path or 'in-memory'}"
+        )
+        if prof.description:
+            print(f"  desc: {prof.description}")
+        print(render_routes_table(resolved, color=color))
+        return 0
+
+    if action == "init":
+        name = str(getattr(args, "name", "") or "").strip()
+        if not name:
+            print("nexus: profile init: name is required", file=sys.stderr)
+            return 2
+        base_name = getattr(args, "base", None)
+        try:
+            if base_name:
+                base_prof = load_profile(base_name)
+                prof = EntityProfile(
+                    name=name,
+                    description=getattr(args, "description", None) or base_prof.description,
+                    mode=getattr(args, "mode", None) or base_prof.mode,
+                    system_persona=getattr(args, "persona", None) or base_prof.system_persona,
+                    handoff_max_turns=base_prof.handoff_max_turns,
+                    handoff_max_chars=base_prof.handoff_max_chars,
+                    default_route=getattr(args, "default_route", None) or base_prof.default_route,
+                    decision_model=base_prof.decision_model,
+                    council_roles=dict(base_prof.council_roles) if base_prof.council_roles else None,
+                    replace_routes=base_prof.replace_routes,
+                    routes=dict(base_prof.routes),
+                    precedence=list(base_prof.precedence) if base_prof.precedence else None,
+                )
+            else:
+                prof = EntityProfile(
+                    name=name,
+                    description=getattr(args, "description", None) or f"Custom Nexus profile '{name}'",
+                    mode=getattr(args, "mode", None) or "entity",
+                    system_persona=getattr(args, "persona", None) or EntityProfile(name=name).system_persona,
+                    default_route=getattr(args, "default_route", None),
+                )
+            dest = save_user_profile(prof)
+        except (OSError, ValueError) as exc:
+            print(f"nexus: profile init: {exc}", file=sys.stderr)
+            return 1
+        print(f"PROFILE | initialized {prof.name} (mode={prof.mode}) -> {dest}")
+        return 0
+
+    print(f"nexus: unknown profile action '{action}'", file=sys.stderr)
+    return 2
+
+
+def cmd_stats(args: argparse.Namespace) -> int:
+    """Summarize execution latency, success rate, and zero-cost ratio from events.jsonl."""
+    color = not getattr(args, "no_color", False)
+    events_path = Path(getattr(args, "events_file", DEFAULT_EVENTS_PATH))
+    limit = max(1, int(getattr(args, "limit", 2000)))
+    group_by = str(getattr(args, "by", "profile") or "profile").strip().lower()
+    events = read_events(path=events_path, limit=limit)
+    stats = compute_performance_stats(events, group_by=group_by)
+    if getattr(args, "json", False):
+        print(json.dumps(stats, indent=2, ensure_ascii=False))
+        return 0
+    width = max(72, min(116, shutil.get_terminal_size(fallback=(96, 30)).columns))
+    print(render_stats_table(stats, group_by=group_by, color=color, width=width))
+    if not getattr(args, "quiet", False):
+        try:
+            from nexus.evolve import detect_improvement_opportunities
+
+            opps = detect_improvement_opportunities(events, routes_data=load_routes())
+            actionable = [o for o in opps if o.get("priority") in ("high", "medium")]
+            if actionable:
+                print(f"IMPROVE | {len(actionable)} opportunity(ies) — run 'nexus evolve suggest'")
+        except Exception:
+            pass
+    return 0
+
+
+def cmd_bench(args: argparse.Namespace) -> int:
+    """Benchmark multiple configuration profiles side-by-side on a benchmark split."""
+    color = not getattr(args, "no_color", False)
+    workspace = Path(getattr(args, "workspace", None) or PROJECT_ROOT)
+    benchmark_arg = getattr(args, "benchmark", None)
+    benchmark_path = Path(benchmark_arg) if benchmark_arg else None
+    split = str(getattr(args, "split", "evolve") or "evolve").replace("-", "_")
+    if split not in ("evolve", "held_out"):
+        print(f"nexus: bench: unknown split '{split}'", file=sys.stderr)
+        return 2
+    raw_profiles = getattr(args, "profiles", None) or ""
+    profile_names = [part.strip() for part in str(raw_profiles).split(",") if part.strip()]
+    try:
+        rows = benchmark_profiles(
+            workspace,
+            profile_names,
+            benchmark_path=benchmark_path,
+            split=split,
+        )
+    except (OSError, ValueError) as exc:
+        print(f"nexus: bench: {exc}", file=sys.stderr)
+        return 1
+    if getattr(args, "json", False):
+        print(json.dumps(rows, indent=2, ensure_ascii=False))
+        return 0
+    width = max(72, min(116, shutil.get_terminal_size(fallback=(96, 30)).columns))
+    print(render_bench_table(rows, split=split, color=color, width=width))
+    return 0
+
+
+def dispatch_with_front_desk(
+    prompt: str,
+    *,
+    explicit_route: Optional[str] = None,
+    attach_file: Optional[Path] = None,
+    session_id: Optional[str] = None,
+    events_path: Path = DEFAULT_EVENTS_PATH,
+    dry_run: bool = False,
+    use_llm_decision: bool = False,
+    color: bool = True,
+    show_tree: bool = True,
+    verbosity: int = VERBOSITY_DEFAULT,
+    think: Optional[str | bool] = None,
+    allow_fallback: bool = True,
+    history_messages: Optional[list[dict]] = None,
+    out_file: Optional[Path] = None,
+    profile: Optional[EntityProfile] = None,
+    routes_data: Optional[dict] = None,
+    system_persona: str = "",
+    handoff_context: str = "",
+    entity_history: Optional[list[dict]] = None,
+    last_route: Optional[str] = None,
+    route_sessions: Optional[dict[tuple[str, str], str]] = None,
+) -> tuple[int, Optional[OrchestratorDecision], Optional[ExecutionResult]]:
+    """Run the Front-Facing Free Decision Model (or locked-in orchestrator) and spawn the chosen orchestrator."""
+    active_routes_data = (
+        routes_data
+        if routes_data is not None
+        else (resolve_profile_routes(profile, load_routes()) if profile is not None else load_routes())
+    )
+    profile_name = profile.name if profile is not None else ""
+    persona = system_persona or (
+        profile.system_persona if (profile is not None and profile.mode != "single") else ""
+    )
+
+    if (
+        profile is not None
+        and profile.mode == "ensemble"
+        and explicit_route is None
+        and not prompt.lstrip().startswith("@")
+    ):
+        rc, synth_res = _run_unified_ensemble_cli(
+            prompt,
+            profile=profile,
+            routes_data=active_routes_data,
+            attach_file=attach_file,
+            events_path=events_path,
+            dry_run=dry_run,
+            color=color,
+            verbosity=verbosity,
+            think=think,
+            allow_fallback=allow_fallback,
+            history_messages=history_messages,
+            handoff_context=handoff_context,
+            entity_history=entity_history,
+            last_route=last_route,
+            route_sessions=route_sessions,
+            out_file=out_file,
+        )
+        synth_cfg = dict((active_routes_data.get("routes") or {}).get(synth_res.route) or {}) if synth_res else {}
+        synth_dec = OrchestratorDecision(
+            route_key=synth_res.route if synth_res else str(profile.default_route or "code"),
+            route_cfg=synth_cfg,
+            reason=f"ensemble ({profile.name})",
+            orchestrator="ensemble",
+            cleaned_prompt=prompt,
+            take_charge=False,
+        )
+        return rc, synth_dec, synth_res
+
+    try:
+        decision = front_desk_decide(
+            prompt,
+            explicit_route=explicit_route,
+            routes_data=active_routes_data,
+            use_llm=(use_llm_decision and not dry_run and explicit_route is None),
+        )
+    except KeyError as exc:
+        print(f"nexus: {exc}", file=sys.stderr)
+        return 2, None, None
+    except KeyboardInterrupt:
+        print("\nnexus: [INTERRUPTED] Front-desk decision cancelled (Ctrl-C)", file=sys.stderr)
+        return 130, None, None
+
+    if explicit_route is not None or prompt.lstrip().startswith("@"):
+        mode = "explicit"
+    elif use_llm_decision:
+        mode = "free-decision"
+    else:
+        mode = "keyword"
+
+    desk_parts = [f"front-desk → @{decision.route_key}", mode]
+    if profile_name:
+        desk_parts.append(f"profile:{profile_name}")
+    if decision.orchestrator == "council":
+        desk_parts.append("orchestrator: council")
+    if mode == "free-decision":
+        desk_parts.append(decision.decision_model)
+    desk_parts.append(format_duration(decision.elapsed_ms))
+    if mode == "free-decision" and (decision.tokens_in or decision.tokens_out):
+        desk_parts.append(
+            f"{format_tokens(decision.tokens_in)}→{format_tokens(decision.tokens_out)} tok"
+        )
+    _log(status_line("info", " · ".join(desk_parts), color=color), verbosity=verbosity)
+    _log(
+        status_line("cont", f"reason: {decision.reason}", color=color),
+        verbosity=verbosity,
+        minimum=VERBOSITY_VERBOSE,
+    )
+    if dry_run:
+        _log(status_line("warn", "dry-run: no backend will be invoked", color=color), verbosity=verbosity)
+
+    if decision.orchestrator == "council":
+        rc = run_council_fanout(
+            decision.cleaned_prompt,
+            events_path=events_path,
+            dry_run=dry_run,
+            color=color,
+            verbosity=verbosity,
+            profile=profile,
+            routes_data=active_routes_data,
+            handoff_context=handoff_context,
+        )
+        return rc, decision, None
+
+    trace_id = new_trace_id()
+    root_span = new_span_id()
+    t0 = time.monotonic()
+
+    front_backend = "opencode" if use_llm_decision else "nexus"
+    front_model = decision.decision_model if use_llm_decision else "nexus-router"
+    front_tier = "FREE" if use_llm_decision else "ORCHESTRATOR"
+
+    emit_event(
+        trace_id,
+        root_span,
+        parent_id=None,
+        route="front-desk" if use_llm_decision else "entrypoint",
+        intent="decision",
+        backend=front_backend,
+        model=front_model,
+        quota_tier=front_tier,
+        status="RUNNING",
+        step=f"handoff->@{decision.route_key} ({decision.reason})",
+        prompt=decision.cleaned_prompt[:200],
+        tokens_in=decision.tokens_in,
+        tokens_out=decision.tokens_out,
+        elapsed_ms=decision.elapsed_ms,
+        profile=profile_name,
+        path=events_path,
+    )
+
+    child_route_label = f"in-charge:{decision.route_key}" if decision.take_charge else decision.route_key
+    route_cfg = decision.route_cfg
+    child_backend = str(route_cfg.get("backend", "opencode"))
+
+    resolved_session_id = session_id
+    if resolved_session_id is None and route_sessions is not None:
+        resolved_session_id = route_sessions.get((decision.route_key, child_backend))
+
+    resolved_history = history_messages
+    resolved_handoff = handoff_context
+    if entity_history:
+        if child_backend in ("ollama", "openai-compat", "colibri"):
+            if resolved_history is None:
+                resolved_history = entity_history[-12:]
+            resolved_handoff = ""
+        elif not resolved_handoff and (resolved_session_id is None or last_route != decision.route_key):
+            resolved_handoff = build_handoff_context(
+                entity_history,
+                max_turns=profile.handoff_max_turns if profile is not None else 8,
+                max_chars=profile.handoff_max_chars if profile is not None else 6000,
+            )
+
+    spawn_parts = [
+        f"spawn @{decision.route_key}",
+        f"{child_backend}:{route_cfg.get('model')}",
+        format_quota_badge(str(route_cfg.get("quota_tier", "FREE")), color=color),
+        f"timeout {format_duration(int(float(route_cfg.get('timeout_s', 120)) * 1000))}",
+    ]
+    if decision.take_charge:
+        spawn_parts.append("in charge")
+    _log(status_line("step", " · ".join(spawn_parts), color=color), verbosity=verbosity)
+    if verbosity >= VERBOSITY_VERBOSE:
+        preview = " ".join(decision.cleaned_prompt.split())[:96]
+        _log(
+            status_line("cont", f"intent: {route_cfg.get('intent', decision.route_key)}", color=color),
+            verbosity=verbosity,
+        )
+        _log(status_line("cont", f'prompt: "{preview}"', color=color), verbosity=verbosity)
+        _log(
+            status_line("cont", f"trace: {trace_id} (nexus watch --trace {trace_id})", color=color),
+            verbosity=verbosity,
+        )
+    res = execute_route(
+        trace_id,
+        child_route_label,
+        decision.route_cfg,
+        decision.cleaned_prompt,
+        parent_id=root_span,
+        attach_file=attach_file,
+        session_id=resolved_session_id,
+        events_path=events_path,
+        dry_run=dry_run,
+        color=color,
+        verbosity=verbosity,
+        think=think,
+        allow_fallback=allow_fallback,
+        history_messages=resolved_history,
+        system_persona=persona,
+        handoff_context=resolved_handoff,
+        profile=profile_name,
+    )
+
+    total_ms = int((time.monotonic() - t0) * 1000) + decision.elapsed_ms
+    # backends prints the per-span receipt; add the wall-clock total either when
+    # the tree is suppressed or when verbose detail was requested.
+    if not show_tree or verbosity >= VERBOSITY_VERBOSE:
+        _log(
+            status_line(
+                "ok" if res.status == "DONE" else "fail",
+                f"@{decision.route_key} total {format_duration(total_ms)} · front-desk {format_duration(decision.elapsed_ms)}"
+                f" · child {format_duration(res.elapsed_ms)}",
+                color=color,
+            ),
+            verbosity=verbosity,
+        )
+    if res.status == "DONE" and not res.output.strip():
+        _log(status_line("warn", f"@{decision.route_key} returned empty output", color=color), verbosity=verbosity)
+    emit_event(
+        trace_id,
+        root_span,
+        parent_id=None,
+        route="front-desk" if use_llm_decision else "entrypoint",
+        intent="decision",
+        backend=front_backend,
+        model=front_model,
+        quota_tier=front_tier,
+        status="DONE" if res.status == "DONE" else "FAIL",
+        step=f"spawned @{decision.route_key} [{res.status}] — {decision.reason}",
+        prompt=decision.cleaned_prompt[:200],
+        tokens_in=decision.tokens_in,
+        tokens_out=decision.tokens_out,
+        elapsed_ms=total_ms,
+        profile=profile_name,
+        path=events_path,
+    )
+
+    if show_tree:
+        _print_live_tree(trace_id, events_path, color=color, verbosity=verbosity)
+
+    if res.output:
+        print(res.output)
+        if out_file is not None and res.status == "DONE":
+            try:
+                saved = save_text_artifact(res.output, str(out_file), raw_path=True)
+                exec_tag = " (+x)" if saved["executable"] else ""
+                _log(
+                    status_line("ok", f"saved {saved['bytes']} B → {saved['path']}{exec_tag}", color=color),
+                    verbosity=verbosity,
+                )
+            except (ValueError, OSError) as exc:
+                print(f"nexus: save failed: {exc}", file=sys.stderr)
+                return 1, decision, res
+    if res.status == "INTERRUPTED":
+        print(f"nexus: [INTERRUPTED] {res.error}", file=sys.stderr)
+        return 130, decision, res
+    if res.status != "DONE":
+        if res.error:
+            print(f"nexus: [{res.status}] {res.error}", file=sys.stderr)
+        return 1, decision, res
+    return 0, decision, res
+
+
+def run_single_prompt(
+    prompt: str,
+    *,
+    explicit_route: Optional[str] = None,
+    attach_file: Optional[Path] = None,
+    session_id: Optional[str] = None,
+    events_path: Path = DEFAULT_EVENTS_PATH,
+    dry_run: bool = False,
+    use_llm_decision: bool = False,
+    color: bool = True,
+    show_tree: bool = True,
+    verbosity: int = VERBOSITY_DEFAULT,
+    think: Optional[str | bool] = None,
+    allow_fallback: bool = True,
+    history_messages: Optional[list[dict]] = None,
+    out_file: Optional[Path] = None,
+    profile: Optional[EntityProfile] = None,
+    routes_data: Optional[dict] = None,
+    system_persona: str = "",
+    handoff_context: str = "",
+) -> int:
+    rc, _, _ = dispatch_with_front_desk(
+        prompt,
+        explicit_route=explicit_route,
+        attach_file=attach_file,
+        session_id=session_id,
+        events_path=events_path,
+        dry_run=dry_run,
+        use_llm_decision=use_llm_decision,
+        color=color,
+        show_tree=show_tree,
+        verbosity=verbosity,
+        think=think,
+        allow_fallback=allow_fallback,
+        history_messages=history_messages,
+        out_file=out_file,
+        profile=profile,
+        routes_data=routes_data,
+        system_persona=system_persona,
+        handoff_context=handoff_context,
+    )
+    return rc
+
+
+def _run_unified_ensemble_cli(
+    prompt: str,
+    *,
+    profile: Optional[EntityProfile] = None,
+    routes_data: Optional[dict] = None,
+    attach_file: Optional[Path] = None,
+    events_path: Path = DEFAULT_EVENTS_PATH,
+    dry_run: bool = False,
+    color: bool = True,
+    verbosity: int = VERBOSITY_DEFAULT,
+    think: Optional[str | bool] = None,
+    allow_fallback: bool = True,
+    history_messages: Optional[list[dict]] = None,
+    handoff_context: str = "",
+    entity_history: Optional[list[dict]] = None,
+    last_route: Optional[str] = None,
+    route_sessions: Optional[dict[tuple[str, str], str]] = None,
+    out_file: Optional[Path] = None,
+) -> tuple[int, Optional[ExecutionResult]]:
+    """Run parallel specialist seats and synthesize one cohesive answer for CLI/REPL."""
+    active_routes_data = (
+        routes_data
+        if routes_data is not None
+        else (resolve_profile_routes(profile, load_routes()) if profile is not None else load_routes())
+    )
+    routes = active_routes_data.get("routes", {})
+    council_roles = active_routes_data.get(
+        "council_roles",
+        {"pioneer": "fast-code", "red_teamer": "free-reason", "synthesizer": "refactor"},
+    )
+    profile_name = profile.name if profile is not None else ""
+    persona = profile.system_persona if profile is not None else ""
+    synth_key = str(
+        council_roles.get("synthesizer")
+        or (profile.default_route if profile is not None else None)
+        or active_routes_data.get("default_route", "code")
+    )
+    synth_cfg = dict(routes.get(synth_key) or routes.get("code") or {})
+
+    seat_specs = [
+        ("pioneer", str(council_roles.get("pioneer", "fast-code")),
+         f"[Pioneer / Thesis — concise 3 bullets]: {prompt}"),
+        ("red_teamer", str(council_roles.get("red_teamer", "free-reason")),
+         f"[Red-Teamer / Antithesis — risks & failure modes in 3 bullets]: {prompt}"),
+        ("architect", synth_key,
+         f"[Architect / Trade-offs — concise recommendation in 3 bullets]: {prompt}"),
+    ]
+    budgets = load_budgets(active_routes_data)
+    max_children = max(0, int(budgets.get("max_children", 8)))
+    if max_children < 1:
+        print("nexus: ensemble refused: max_children is 0", file=sys.stderr)
+        return 2, None
+    seat_specs = seat_specs[: max(0, max_children - 1)]
+    allowed, why = budget_allows(
+        budgets,
+        spans=2 + len(seat_specs),
+        children=len(seat_specs) + 1,
+        depth=1,
+    )
+    if not allowed:
+        print(f"nexus: ensemble refused: {why}", file=sys.stderr)
+        return 2, None
+
+    trace_id = new_trace_id()
+    root_span = new_span_id()
+    t0 = time.monotonic()
+    emit_event(
+        trace_id,
+        root_span,
+        parent_id=None,
+        route="ensemble",
+        intent="unified-ensemble",
+        backend="nexus",
+        model=f"ensemble:{synth_key}",
+        quota_tier="ORCHESTRATOR",
+        status="RUNNING",
+        step=f"ensemble->{len(seat_specs)} seats + synth @{synth_key}",
+        prompt=prompt[:200],
+        profile=profile_name,
+        path=events_path,
+    )
+    _log(
+        status_line(
+            "info",
+            f"ensemble · {len(seat_specs)} seats -> synth @{synth_key}"
+            + (f" · profile:{profile_name}" if profile_name else ""),
+            color=color,
+        ),
+        verbosity=verbosity,
+    )
+    if dry_run:
+        _log(status_line("warn", "dry-run: no backend will be invoked", color=color), verbosity=verbosity)
+
+    seat_results: dict[str, ExecutionResult] = {}
+    lock = threading.Lock()
+    interrupted = False
+
+    def _run_seat(seat_name: str, r_key: str, seat_prompt: str) -> None:
+        cfg = dict(routes.get(r_key) or routes.get("code") or {})
+        cfg["intent"] = f"ensemble:{seat_name}"
+        res = execute_route(
+            trace_id,
+            f"{seat_name}:{r_key}",
+            cfg,
+            seat_prompt,
+            parent_id=root_span,
+            attach_file=attach_file,
+            events_path=events_path,
+            dry_run=dry_run,
+            color=color,
+            verbosity=verbosity,
+            think=think,
+            allow_fallback=allow_fallback,
+            emit_stderr=(verbosity >= VERBOSITY_VERBOSE),
+            profile=profile_name,
+        )
+        with lock:
+            seat_results[seat_name] = res
+
+    if seat_specs:
+        pool = ThreadPoolExecutor(max_workers=max(1, len(seat_specs)))
+        try:
+            futures = [
+                pool.submit(_run_seat, s_name, r_key, s_prompt)
+                for s_name, r_key, s_prompt in seat_specs
+            ]
+            for fut in futures:
+                fut.result()
+        except KeyboardInterrupt:
+            interrupted = True
+            pool.shutdown(wait=False, cancel_futures=True)
+        else:
+            pool.shutdown(wait=True)
+
+    if any(r.status == "INTERRUPTED" for r in seat_results.values()):
+        interrupted = True
+    if interrupted:
+        emit_event(
+            trace_id,
+            root_span,
+            parent_id=None,
+            route="ensemble",
+            intent="unified-ensemble",
+            backend="nexus",
+            model=f"ensemble:{synth_key}",
+            quota_tier="ORCHESTRATOR",
+            status="FAIL",
+            step="interrupted (Ctrl-C)",
+            prompt=prompt[:200],
+            elapsed_ms=int((time.monotonic() - t0) * 1000),
+            error="Interrupted by user (Ctrl-C)",
+            profile=profile_name,
+            path=events_path,
+        )
+        print("nexus: [INTERRUPTED] Ensemble cancelled by user (Ctrl-C)", file=sys.stderr)
+        return 130, None
+
+    seat_outputs = [
+        (s_name, seat_results[s_name].output.strip())
+        for s_name, _k, _p in seat_specs
+        if s_name in seat_results and seat_results[s_name].output.strip()
+    ]
+    synth_prompt = build_synthesis_prompt(
+        prompt,
+        seat_outputs or [("direct", prompt)],
+        system_persona=persona,
+    )
+    synth_backend = str(synth_cfg.get("backend", "opencode"))
+    resolved_session = (
+        route_sessions.get((synth_key, synth_backend)) if route_sessions is not None else None
+    )
+    resolved_history = history_messages
+    resolved_handoff = handoff_context
+    if entity_history:
+        if synth_backend in ("ollama", "openai-compat", "colibri"):
+            if resolved_history is None:
+                resolved_history = entity_history[-12:]
+            resolved_handoff = ""
+        elif not resolved_handoff and (resolved_session is None or last_route != synth_key):
+            resolved_handoff = build_handoff_context(
+                entity_history,
+                max_turns=profile.handoff_max_turns if profile is not None else 8,
+                max_chars=profile.handoff_max_chars if profile is not None else 6000,
+            )
+
+    synth_res = execute_route(
+        trace_id,
+        f"synth:{synth_key}",
+        synth_cfg,
+        synth_prompt,
+        parent_id=root_span,
+        attach_file=attach_file,
+        session_id=resolved_session,
+        events_path=events_path,
+        dry_run=dry_run,
+        color=color,
+        verbosity=verbosity,
+        think=think,
+        allow_fallback=allow_fallback,
+        history_messages=resolved_history,
+        handoff_context=resolved_handoff,
+        profile=profile_name,
+    )
+    total_ms = int((time.monotonic() - t0) * 1000)
+    emit_event(
+        trace_id,
+        root_span,
+        parent_id=None,
+        route="ensemble",
+        intent="unified-ensemble",
+        backend="nexus",
+        model=f"ensemble:{synth_key}",
+        quota_tier="ORCHESTRATOR",
+        status="DONE" if synth_res.status == "DONE" else "FAIL",
+        step=f"{len(seat_outputs)}/{len(seat_specs)} seats -> synth [{synth_res.status}]",
+        prompt=prompt[:200],
+        elapsed_ms=total_ms,
+        profile=profile_name,
+        path=events_path,
+    )
+    _print_live_tree(trace_id, events_path, color=color, verbosity=verbosity)
+    if synth_res.output:
+        print(synth_res.output)
+        if out_file is not None and synth_res.status == "DONE":
+            try:
+                saved = save_text_artifact(synth_res.output, str(out_file), raw_path=True)
+                exec_tag = " (+x)" if saved["executable"] else ""
+                _log(
+                    status_line("ok", f"saved {saved['bytes']} B → {saved['path']}{exec_tag}", color=color),
+                    verbosity=verbosity,
+                )
+            except (ValueError, OSError) as exc:
+                print(f"nexus: save failed: {exc}", file=sys.stderr)
+                return 1, synth_res
+    if synth_res.status == "INTERRUPTED":
+        return 130, synth_res
+    return (0 if synth_res.status == "DONE" else 1), synth_res
+
+
+def run_council_fanout(
+    prompt: str,
+    *,
+    events_path: Path = DEFAULT_EVENTS_PATH,
+    dry_run: bool = False,
+    color: bool = True,
+    verbosity: int = VERBOSITY_DEFAULT,
+    unified: bool = False,
+    profile: Optional[EntityProfile] = None,
+    routes_data: Optional[dict] = None,
+    handoff_context: str = "",
+) -> int:
+    """Run a parallel 3-model Tripartite Council (Pioneer / Red-Teamer / Synthesizer) at zero-cost."""
+    if unified:
+        rc, _ = _run_unified_ensemble_cli(
+            prompt,
+            profile=profile,
+            routes_data=routes_data,
+            events_path=events_path,
+            dry_run=dry_run,
+            color=color,
+            verbosity=verbosity,
+            handoff_context=handoff_context,
+        )
+        return rc
+
+    active_routes_data = (
+        routes_data
+        if routes_data is not None
+        else (resolve_profile_routes(profile, load_routes()) if profile is not None else load_routes())
+    )
+    profile_name = profile.name if profile is not None else ""
+    routes = active_routes_data.get("routes", {})
+    council_roles = active_routes_data.get(
+        "council_roles",
+        {"pioneer": "fast-code", "red_teamer": "free-reason", "synthesizer": "refactor"},
+    )
+
+    trace_id = new_trace_id()
+    root_span = new_span_id()
+    t0 = time.monotonic()
+
+    emit_event(
+        trace_id,
+        root_span,
+        parent_id=None,
+        route="council",
+        intent="tripartite-council",
+        backend="nexus",
+        model="nexus-council",
+        quota_tier="ORCHESTRATOR",
+        status="RUNNING",
+        step="fanout->3 specialist models",
+        prompt=prompt[:200],
+        profile=profile_name,
+        path=events_path,
+    )
+
+    role_prompts = [
+        ("pioneer", council_roles.get("pioneer", "fast-code"), f"[Pioneer / Thesis — concise 3 bullets]: {prompt}"),
+        ("red_teamer", council_roles.get("red_teamer", "free-reason"), f"[Red-Teamer / Antithesis — risks & failure modes in 3 bullets]: {prompt}"),
+        ("synthesizer", council_roles.get("synthesizer", "refactor"), f"[Synthesizer / Pragmatic Verdict in 3 bullets]: {prompt}"),
+    ]
+
+    lock = threading.Lock()
+
+    budgets = load_budgets(active_routes_data)
+    allowed, why = budget_allows(budgets, spans=1 + len(role_prompts), children=len(role_prompts), depth=1)
+    if not allowed:
+        print(f"nexus: council refused: {why}", file=sys.stderr)
+        return 2
+    if len(role_prompts) > int(budgets["max_children"]):
+        role_prompts = role_prompts[: int(budgets["max_children"])]
+        print(f"nexus: council capped to max_children={budgets['max_children']}", file=sys.stderr)
+
+    seat_plan = " · ".join(f"{name}→{key}" for name, key, _ in role_prompts)
+    _log(
+        status_line(
+            "info",
+            f"council · {len(role_prompts)} seats · {seat_plan} · max_spans {budgets['max_spans_per_trace']}",
+            color=color,
+        ),
+        verbosity=verbosity,
+    )
+    if dry_run:
+        _log(status_line("warn", "dry-run: no backend will be invoked", color=color), verbosity=verbosity)
+
+    def _run_seat(seat_name: str, r_key: str, seat_prompt: str) -> tuple[str, ExecutionResult]:
+        cfg = dict(routes.get(r_key, routes.get("code", {})))
+        cfg["intent"] = f"council:{seat_name}"
+        res = execute_route(
+            trace_id,
+            f"{seat_name}:{r_key}",
+            cfg,
+            seat_prompt,
+            parent_id=root_span,
+            events_path=events_path,
+            dry_run=dry_run,
+            color=color,
+            verbosity=verbosity,
+            profile=profile_name,
+        )
+        return seat_name, res
+
+    results: list[tuple[str, ExecutionResult]] = []
+    interrupted = False
+    pool = ThreadPoolExecutor(max_workers=3)
+    try:
+        futures = [pool.submit(_run_seat, s_name, r_key, s_prompt) for s_name, r_key, s_prompt in role_prompts]
+        for fut in futures:
+            res_pair = fut.result()
+            with lock:
+                results.append(res_pair)
+    except KeyboardInterrupt:
+        interrupted = True
+        pool.shutdown(wait=False, cancel_futures=True)
+    else:
+        pool.shutdown(wait=True)
+
+    if any(r.status == "INTERRUPTED" for _, r in results):
+        interrupted = True
+
+    total_ms = int((time.monotonic() - t0) * 1000)
+    all_ok = (not interrupted) and len(results) == len(role_prompts) and all(r.status == "DONE" for _, r in results)
+    emit_event(
+        trace_id,
+        root_span,
+        parent_id=None,
+        route="council",
+        intent="tripartite-council",
+        backend="nexus",
+        model="nexus-council",
+        quota_tier="ORCHESTRATOR",
+        status="DONE" if all_ok else "FAIL",
+        step="3/3 seats complete" if all_ok else ("interrupted (Ctrl-C)" if interrupted else "partial failure"),
+        prompt=prompt[:200],
+        elapsed_ms=total_ms,
+        error="Interrupted by user (Ctrl-C)" if interrupted else "",
+        profile=profile_name,
+        path=events_path,
+    )
+
+    _print_live_tree(trace_id, events_path, color=color, verbosity=verbosity)
+
+    done_seats = [name for name, r in results if r.status == "DONE"]
+    tok_in = sum(r.tokens_in for _, r in results)
+    tok_out = sum(r.tokens_out for _, r in results)
+    summary = (
+        f"council · {len(done_seats)}/{len(role_prompts)} seats · {format_duration(total_ms)}"
+        f" · {format_tokens(tok_in)}→{format_tokens(tok_out)} tok · $0 premium"
+    )
+    if interrupted:
+        _log(status_line("stop", "council interrupted (Ctrl-C)", color=color), verbosity=verbosity)
+    elif all_ok:
+        _log(status_line("ok", summary, color=color), verbosity=verbosity)
+    else:
+        failed = [f"{name}({r.status})" for name, r in results if r.status != "DONE"]
+        _log(
+            status_line("fail", f"{summary} · failed: {', '.join(failed) or 'seats not run'}", color=color),
+            verbosity=verbosity,
+        )
+
+    if interrupted:
+        print("nexus: [INTERRUPTED] Council cancelled by user (Ctrl-C)", file=sys.stderr)
+        return 130
+
+    term_cols = shutil.get_terminal_size(fallback=(88, 30)).columns
+    card_width = max(56, min(100, term_cols))
+    for seat_name, res in results:
+        title = seat_name.upper().replace("_", "-")
+        badge = format_quota_badge(res.quota_tier, color=color)
+        icon = "✓" if res.status == "DONE" else "✗"
+        card_title = f"[council // {title}] · {res.model} · {badge}"
+        body = res.output or f"({res.status}: {res.error})"
+        wrapped: list[str] = []
+        for bline in body.splitlines():
+            stripped = bline.rstrip()
+            if not stripped:
+                wrapped.append("")
+            else:
+                wrapped.extend(textwrap.wrap(stripped, width=card_width - 4) or [""])
+        footer = (
+            f"{icon} {res.status} {format_duration(res.elapsed_ms)}"
+            f" · {format_tokens(res.tokens_in)}→{format_tokens(res.tokens_out)} tok"
+            + (f" · {format_tokens(res.tokens_cached)} cached" if res.tokens_cached else "")
+        )
+        print("\n" + render_panel(wrapped, title=card_title, footer=footer, width=card_width))
+
+    return 0 if all_ok else 1
+
+
+REPL_SLASH_COMMANDS = [
+    "/profile ",
+    "/pin ",
+    "/unpin",
+    "/mode ",
+    "/stats",
+    "/release",
+    "/front",
+    "/back",
+    "/switch ",
+    "/tui",
+    "/square",
+    "/post ",
+    "/board ",
+    "/council ",
+    "/routes",
+    "/validate",
+    "/sim",
+    "/think",
+    "/save",
+    "/verbose",
+    "/quiet",
+    "/tree",
+    "/help",
+    "/quit",
+    "/exit",
+]
+
+DEFAULT_HISTORY_PATH = Path.home() / ".local/state/nexus/history"
+
+
+def complete_repl_candidates(
+    line_buffer: str,
+    text: str,
+    begidx: int,
+    route_keys: list[str],
+) -> list[str]:
+    """Compute tab-completion candidates for the interactive Nexus REPL."""
+    at_routes = [f"@{k} " for k in sorted(route_keys)]
+    bare_routes = [f"{k}" for k in sorted(route_keys)]
+
+    stripped_left = line_buffer[:begidx].lstrip()
+    if stripped_left.startswith("/switch") or stripped_left.startswith("/pin"):
+        pool = bare_routes + [f"@{k}" for k in sorted(route_keys)]
+        return [c for c in pool if c.startswith(text)]
+
+    if stripped_left.startswith("/profile"):
+        prof_names = [p.name for p in list_profiles()]
+        return [n for n in prof_names if n.startswith(text)]
+
+    if stripped_left.startswith("/mode"):
+        return [m for m in ("entity", "sticky") if m.startswith(text)]
+
+    if stripped_left.startswith("/stats"):
+        return [g for g in ("profile", "route", "model") if g.startswith(text)]
+
+    if stripped_left.startswith("/think "):
+        return [c for c in THINK_LEVELS if c.startswith(text)]
+
+    if begidx == 0:
+        if text.startswith("/"):
+            return [c for c in REPL_SLASH_COMMANDS if c.startswith(text)]
+        if text.startswith("@"):
+            return [c for c in at_routes if c.startswith(text)]
+        if text == "":
+            return REPL_SLASH_COMMANDS + at_routes
+        return [c for c in (REPL_SLASH_COMMANDS + at_routes) if c.startswith(text)]
+
+    if text.startswith("@"):
+        return [c for c in at_routes if c.startswith(text)]
+    return []
+
+
+def _setup_readline(route_keys: list[str], history_path: Path = DEFAULT_HISTORY_PATH) -> Optional[object]:
+    """Configure readline tab-completion and persistent command history when running in a TTY."""
+    if not sys.stdin.isatty():
+        return None
+    try:
+        import readline
+    except ImportError:
+        return None
+
+    state_cache: dict[str, list[str]] = {"matches": []}
+
+    def _completer(text: str, state: int) -> Optional[str]:
+        if state == 0:
+            line_buf = readline.get_line_buffer()
+            begidx = readline.get_begidx()
+            state_cache["matches"] = complete_repl_candidates(line_buf, text, begidx, route_keys)
+        matches = state_cache["matches"]
+        return matches[state] if state < len(matches) else None
+
+    readline.set_completer_delims(" \t\n")
+    readline.set_completer(_completer)
+    doc = getattr(readline, "__doc__", "") or ""
+    if "libedit" in doc:
+        readline.parse_and_bind("bind ^I rl_complete")
+    else:
+        readline.parse_and_bind("tab: complete")
+
+    try:
+        history_path.parent.mkdir(parents=True, exist_ok=True)
+        if history_path.exists():
+            readline.read_history_file(str(history_path))
+        readline.set_history_length(500)
+    except OSError:
+        pass
+    return readline
+
+
+def _save_readline_history(rl_mod: Optional[object], history_path: Path = DEFAULT_HISTORY_PATH) -> None:
+    if rl_mod is None:
+        return
+    try:
+        history_path.parent.mkdir(parents=True, exist_ok=True)
+        rl_mod.write_history_file(str(history_path))  # type: ignore[attr-defined]
+    except OSError:
+        pass
+
+
+def print_repl_banner(
+    decision_model: str,
+    color: bool = True,
+    verbosity: int = VERBOSITY_DEFAULT,
+    *,
+    profile: Optional[EntityProfile] = None,
+    entity_mode: bool = True,
+) -> None:
+    """Print the sharp 0-gap skeletal startup banner with 2-column command reference."""
+    width = 82
+    title = "[0:nexus] UNIFIED ENTITY ROUTER & SPECIALIST CONSOLE"
+    rem_top = max(0, width - visible_len(title) - 6)
+    top_line = f"┌─ {title} {'─' * rem_top}─┐"
+
+    badge = format_quota_badge("FREE", color=color)
+    level = {0: "quiet", 1: "default", 2: "verbose"}.get(verbosity, "default")
+    prof_label = f"{profile.name} [{profile.mode}]" if profile is not None else "default [entity]"
+    mode_tag = "entity" if entity_mode else "sticky"
+    model_line = f"Profile: {prof_label} ({mode_tag}) · Decision: {decision_model} {badge}"
+
+    cmds = [
+        ("/profile [n]", "list/swap config profile", "/stats [by]", "latency & quota stats"),
+        ("/pin <route>", "pin one specialist route", "/unpin", "clear pinned route"),
+        ("/mode <kind>", "entity or sticky mode", "/council <q>", "run 3-seat council"),
+        ("/routes", "list specialist table", "/tree", "render live tree"),
+        ("/validate", "audit model pins", "/square", "view town square"),
+        ("/think <lvl>", "thinking effort", "/sim", "show SIM ledger"),
+        ("/verbose [0-2]", "set log detail level", "/save [file]", "save to drops"),
+        ("/tui", "open interactive TUI", "/quit", "exit nexus console"),
+    ]
+
+    lines = [top_line]
+    lines.append(f"│ {pad_ansi(model_line, width - 4)} │")
+    lines.append(f"│ {pad_ansi('Unified entity routing delegates internally while keeping context intact.', width - 4)} │")
+    lines.append(f"│ {pad_ansi(f'Status output: {level} (/verbose 0=quiet, 1=default, 2=verbose)', width - 4)} │")
+    hdr = "COMMAND REFERENCE (Tab: autocomplete /cmds & @routes · Ctrl-C: cancel/clear)"
+    lines.append(f"├─ {hdr} {'─' * (width - len(hdr) - 5)}┤")
+    for c1, d1, c2, d2 in cmds:
+        left_str = pad_ansi(f"{c1:<15} {d1}", 37)
+        right_str = pad_ansi(f"{c2:<15} {d2}", 37)
+        row_str = f"{left_str} │ {right_str}"
+        lines.append(f"│ {pad_ansi(row_str, width - 4)} │")
+    lines.append(f"└{'─' * (width - 2)}┘")
+    print("\n".join(lines))
+
+
+def run_repl(
+    events_path: Path = DEFAULT_EVENTS_PATH,
+    color: bool = True,
+    dry_run: bool = False,
+    verbosity: int = VERBOSITY_DEFAULT,
+    *,
+    profile_name: Optional[str] = None,
+    sticky: bool = False,
+) -> int:
+    try:
+        active_profile = load_profile(profile_name)
+    except (OSError, ValueError) as exc:
+        print(f"nexus: profile warning: {exc}; falling back to '{DEFAULT_PROFILE_NAME}'", file=sys.stderr)
+        active_profile = EntityProfile(name=DEFAULT_PROFILE_NAME)
+
+    base_routes_data = load_routes()
+    routes_data = resolve_profile_routes(active_profile, base_routes_data)
+    decision_model = routes_data.get("decision_model", DEFAULT_DECISION_MODEL)
+    route_keys = list((routes_data.get("routes") or {}).keys())
+    rl_mod = _setup_readline(route_keys)
+
+    entity_mode = (not sticky) and (active_profile.mode != "single")
+    pinned_route: Optional[str] = None
+    active_route: Optional[str] = None
+    last_route: Optional[str] = None
+    active_model: str = ""
+    active_backend: str = ""
+    active_session_id: Optional[str] = None
+    route_sessions: dict[tuple[str, str], str] = {}
+    consecutive_sigint = 0
+    think_override: Optional[str | bool] = None
+    repl_history: list[dict] = []
+    entity_history: list[dict] = []
+    last_output = ""
+
+    print_repl_banner(
+        decision_model,
+        color=color,
+        verbosity=verbosity,
+        profile=active_profile,
+        entity_mode=entity_mode,
+    )
+
+    try:
+        while True:
+            level_tag = "" if verbosity == VERBOSITY_DEFAULT else f" · v{verbosity}"
+            think_tag = f" · think:{think_override}" if think_override else ""
+            if pinned_route:
+                sid_tag = f" · {active_session_id[:12]}" if active_session_id else ""
+                prompt_str = f"nexus [pinned: @{pinned_route} · {active_model}{sid_tag}{level_tag}{think_tag}]> "
+            elif active_route:
+                sid_tag = f" · {active_session_id[:12]}" if active_session_id else ""
+                prompt_str = f"nexus [in-charge: @{active_route} · {active_model}{sid_tag}{level_tag}{think_tag}]> "
+            elif entity_mode:
+                via_tag = f" · via @{last_route}" if last_route else ""
+                prompt_str = f"nexus [entity: {active_profile.name}{via_tag}{level_tag}{think_tag}]> "
+            else:
+                prompt_str = f"nexus [front-desk · {active_profile.name}{level_tag}{think_tag}]> "
+
+            try:
+                line = input(prompt_str).strip()
+                consecutive_sigint = 0
+            except EOFError:
+                print()
+                return 0
+            except KeyboardInterrupt:
+                consecutive_sigint += 1
+                if consecutive_sigint >= 2:
+                    print("\n[nexus] Exiting on second Ctrl-C.")
+                    return 0
+                print("\n^C  (line cleared — press Ctrl-C again, Ctrl-D, or /quit to exit)")
+                continue
+
+            if not line:
+                continue
+            if line in ("/quit", "/exit", "exit", "quit"):
+                return 0
+            if line in ("/help", "help", "/?"):
+                print_repl_banner(
+                    decision_model,
+                    color=color,
+                    verbosity=verbosity,
+                    profile=active_profile,
+                    entity_mode=entity_mode,
+                )
+                continue
+            if line == "/verbose" or line.startswith("/verbose "):
+                arg = line[len("/verbose"):].strip()
+                if arg in ("0", "1", "2"):
+                    verbosity = int(arg)
+                else:
+                    verbosity = VERBOSITY_VERBOSE if verbosity < VERBOSITY_VERBOSE else VERBOSITY_DEFAULT
+                print(f"[nexus] Verbosity -> {verbosity} ({'quiet' if verbosity == 0 else 'default' if verbosity == 1 else 'verbose'})")
+                continue
+            if line == "/quiet":
+                verbosity = VERBOSITY_QUIET
+                print("[nexus] Verbosity -> 0 (quiet: answers and errors only)")
+                continue
+            if line == "/think" or line.startswith("/think "):
+                arg = line[len("/think"):].strip().lower()
+                if not arg:
+                    print(f"[nexus] Thinking effort -> {think_override or 'default'}")
+                elif arg in ("default", "reset"):
+                    think_override = None
+                    print("[nexus] Thinking effort -> default (backend decides)")
+                elif arg in THINK_LEVELS:
+                    think_override = arg
+                    print(f"[nexus] Thinking effort -> {arg}")
+                else:
+                    print(f"nexus: /think expects {'/'.join(THINK_LEVELS)} or default")
+                continue
+            if line == "/profile" or line.startswith("/profile "):
+                arg = line[len("/profile"):].strip()
+                if not arg:
+                    for prof in list_profiles():
+                        mark = "*" if prof.name == active_profile.name else " "
+                        print(f" {mark} {prof.name:<14} [{prof.mode:<8}] {prof.description}")
+                    continue
+                try:
+                    new_prof = load_profile(arg)
+                except (OSError, ValueError) as exc:
+                    print(f"nexus: profile error: {exc}")
+                    continue
+                active_profile = new_prof
+                routes_data = resolve_profile_routes(active_profile, base_routes_data)
+                decision_model = routes_data.get("decision_model", DEFAULT_DECISION_MODEL)
+                route_keys[:] = list((routes_data.get("routes") or {}).keys())
+                entity_mode = (not sticky) and (active_profile.mode != "single")
+                if entity_mode and not pinned_route:
+                    active_route = None
+                print(
+                    f"[nexus] Profile -> {active_profile.name} ({active_profile.mode}); "
+                    f"{len(entity_history)} history entries preserved."
+                )
+                continue
+            if line == "/mode" or line.startswith("/mode "):
+                arg = line[len("/mode"):].strip().lower()
+                if not arg:
+                    print(f"[nexus] Routing mode -> {'entity' if entity_mode else 'sticky'}")
+                elif arg in ("entity", "sticky"):
+                    sticky = arg == "sticky"
+                    entity_mode = arg == "entity"
+                    if entity_mode and not pinned_route:
+                        active_route = None
+                    print(f"[nexus] Routing mode -> {'unified entity' if entity_mode else 'sticky orchestrator'}")
+                else:
+                    print("nexus: usage: /mode [entity|sticky]")
+                continue
+            if line == "/stats" or line.startswith("/stats "):
+                arg = line[len("/stats"):].strip().lower() or "profile"
+                if arg not in ("profile", "route", "model"):
+                    print("nexus: usage: /stats [profile|route|model]")
+                    continue
+                evs = read_events(path=events_path, limit=1000)
+                print(render_stats_table(compute_performance_stats(evs, group_by=arg), group_by=arg, color=color))
+                continue
+            if line == "/save" or line.startswith("/save "):
+                arg = line[len("/save"):].strip()
+                if not last_output.strip():
+                    print("nexus: nothing to save yet")
+                    continue
+                try:
+                    saved = save_text_artifact(last_output, arg)
+                    exec_tag = " (+x)" if saved["executable"] else ""
+                    print(f"[nexus] Saved {saved['bytes']} B -> {saved['path']}{exec_tag}")
+                except (ValueError, OSError) as exc:
+                    print(f"nexus: save failed: {exc}")
+                continue
+            if line in ("/release", "/front", "/back", "/unpin"):
+                released = pinned_route or active_route
+                if released:
+                    print(
+                        f"[nexus] Unpinned @{released} ({active_model}); "
+                        f"{'unified entity routing active' if entity_mode else 'Front-Desk Decision Model is back in charge'}."
+                    )
+                pinned_route = None
+                active_route = None
+                active_model = ""
+                active_backend = ""
+                active_session_id = None
+                repl_history.clear()
+                continue
+            if line.startswith("/switch ") or line.startswith("/pin "):
+                cmd_len = len("/switch ") if line.startswith("/switch ") else len("/pin ")
+                target_r = line[cmd_len:].strip().lstrip("@")
+                routes = routes_data.get("routes", {})
+                if target_r not in routes:
+                    print(f"nexus: unknown route '@{target_r}' (known: {', '.join(sorted(routes))})")
+                    continue
+                cfg = routes[target_r]
+                pinned_route = target_r
+                active_route = target_r
+                active_model = cfg.get("model", "")
+                active_backend = cfg.get("backend", "opencode")
+                active_session_id = route_sessions.get((target_r, active_backend))
+                repl_history.clear()
+                print(f"[nexus] Pinned -> @{pinned_route} ({active_backend}:{active_model}).")
+                continue
+            try:
+                if line == "/tui":
+                    if active_backend == "agy":
+                        subprocess.run(["agy"], check=False)
+                    elif active_session_id:
+                        subprocess.run(["opencode", "--session", active_session_id], check=False)
+                    else:
+                        subprocess.run(["opencode"], check=False)
+                    continue
+                if line == "/routes":
+                    print(render_routes_table(routes_data, color=color))
+                    continue
+                if line == "/validate":
+                    ns = argparse.Namespace(validate=True, no_color=not color, quiet=False, refresh=False)
+                    cmd_routes(ns)
+                    continue
+                if line == "/sim":
+                    print(render_sim_summary(load_sim(), color=color))
+                    continue
+                if line == "/tree" or line.startswith("/tree "):
+                    trace_filter = line[len("/tree"):].strip() or None
+                    evs = read_events(path=events_path, limit=100, trace_id=trace_filter)
+                    print(render_delegation_tree(evs, trace_id=trace_filter, color=color))
+                    continue
+                if line == "/square":
+                    print(render_square_view())
+                    continue
+                if line.startswith("/post "):
+                    msg = line[len("/post "):].strip()
+                    if msg:
+                        rec = post_square(msg, author=active_route or last_route or "repl", model=active_model or "user")
+                        print(f"[square] Posted {rec['id']} to ~/.local/state/nexus/square.jsonl")
+                    continue
+                if line.startswith("/board "):
+                    b_msg = line[len("/board "):].strip()
+                    write_board("" if b_msg.lower() == "clear" else b_msg, author=active_route or last_route or "repl")
+                    print("[square] Updated ~/.local/state/nexus/BOARD.md")
+                    continue
+                if line.startswith("/council "):
+                    c_prompt = line[len("/council "):].strip()
+                    if c_prompt:
+                        c_rc = run_council_fanout(
+                            c_prompt,
+                            events_path=events_path,
+                            dry_run=dry_run,
+                            color=color,
+                            verbosity=verbosity,
+                            profile=active_profile,
+                            routes_data=routes_data,
+                        )
+                        if c_rc == 130:
+                            print("[nexus] ^C Interrupted active task; returning to console.")
+                    continue
+
+                # If user prefixed with @<route>, let it override for this turn
+                has_at_prefix = line.startswith("@")
+                locked_route = pinned_route if entity_mode else (pinned_route or active_route)
+                explicit_arg = None if has_at_prefix else locked_route
+                local_history = (
+                    repl_history
+                    if (
+                        (not entity_mode or pinned_route is not None)
+                        and active_backend in ("ollama", "openai-compat", "colibri")
+                    )
+                    else None
+                )
+                rc, decision, res = dispatch_with_front_desk(
+                    line,
+                    explicit_route=explicit_arg,
+                    session_id=(None if (has_at_prefix or entity_mode) else active_session_id),
+                    events_path=events_path,
+                    dry_run=dry_run,
+                    use_llm_decision=(locked_route is None and not has_at_prefix),
+                    color=color,
+                    show_tree=verbosity >= VERBOSITY_DEFAULT,
+                    verbosity=verbosity,
+                    think=think_override,
+                    history_messages=local_history,
+                    profile=active_profile,
+                    routes_data=routes_data,
+                    entity_history=entity_history if entity_mode else None,
+                    last_route=last_route,
+                    route_sessions=route_sessions if entity_mode else None,
+                )
+                if rc == 130:
+                    print("[nexus] ^C Interrupted active task; returning to console.")
+                    continue
+                if decision and decision.orchestrator != "council":
+                    chosen_backend = str(decision.route_cfg.get("backend", "opencode"))
+                    last_route = decision.route_key
+                    active_model = str(decision.route_cfg.get("model", ""))
+                    active_backend = chosen_backend
+                    if res and res.session_id:
+                        route_sessions[(decision.route_key, chosen_backend)] = res.session_id
+                    if entity_mode and not pinned_route:
+                        active_route = None
+                        active_session_id = res.session_id if (res and res.session_id) else None
+                    elif decision.take_charge:
+                        if active_route != decision.route_key:
+                            print(
+                                f"[nexus] ★ Orchestrator @{decision.route_key} ({decision.route_cfg.get('model')}) "
+                                f"has taken charge ({decision.reason}). Type /release to return to front-desk."
+                            )
+                            repl_history.clear()
+                            active_session_id = None
+                        active_route = decision.route_key
+                        if res and res.session_id:
+                            active_session_id = res.session_id
+                if res and res.status == "DONE":
+                    if res.model:
+                        active_model = res.model
+                    if res.output.strip():
+                        last_output = res.output
+                        sent_prompt = decision.cleaned_prompt if decision else line
+                        turn_pair = [
+                            {"role": "user", "content": sent_prompt},
+                            {"role": "assistant", "content": res.output},
+                        ]
+                        repl_history.extend(turn_pair)
+                        del repl_history[:-12]
+                        entity_history.extend(turn_pair)
+                        del entity_history[:-24]
+            except KeyboardInterrupt:
+                print("\n[nexus] ^C Interrupted active task; returning to console.")
+                continue
+    finally:
+        _save_readline_history(rl_mod)
+
+
+def _add_output_flags(subparser: argparse.ArgumentParser) -> None:
+    """Mirror the global -q/--no-color flags on a subparser without clobbering them."""
+    subparser.add_argument(
+        "-q", "--quiet", action="store_true", default=argparse.SUPPRESS,
+        help="Only print the model answer and errors (no status lines or tree)",
+    )
+    subparser.add_argument(
+        "--no-color", action="store_true", default=argparse.SUPPRESS,
+        help="Disable ANSI color sequences",
+    )
+
+
+def _add_evolve_flags(subparser: argparse.ArgumentParser, *, suppress_existing: bool = False) -> None:
+    """Add the shared evolve flags to a parser or sub-action parser.
+
+    ``suppress_existing=True`` is used on sub-actions so a value given on either
+    side of the action keyword survives (``nexus evolve --rounds 2 run`` and
+    ``nexus evolve run --rounds 2`` behave identically). Flags that also exist
+    globally always use ``argparse.SUPPRESS`` (see AGENTS.md).
+    """
+
+    def default(value: object) -> object:
+        return argparse.SUPPRESS if suppress_existing else value
+
+    subparser.add_argument(
+        "--sim", type=Path, default=default(None), help="SIM ledger path (default: NEXUS_SIM_PATH or ~/.local/state/nexus/sim.json)"
+    )
+    subparser.add_argument(
+        "--benchmark", type=Path, default=default(None), help="Benchmark spec JSON (default: config/evals/routing_benchmark.json)"
+    )
+    subparser.add_argument(
+        "--policy-file", type=Path, default=default(None), help="Scope policy JSON (default: config/sim_policy.json)"
+    )
+    subparser.add_argument(
+        "--workspace", type=Path, default=default(None), help="Workspace to evolve (default: the nexus repo root)"
+    )
+    subparser.add_argument(
+        "--proposer-route", default=default("refactor"), help="Specialist route that proposes edits (default: refactor)"
+    )
+    subparser.add_argument(
+        "--selector-route", default=default("reason"), help="Specialist route that selects a candidate (default: reason)"
+    )
+    subparser.add_argument(
+        "--policy-route", dest="policy_routes", action="append", default=default(None),
+        help="Restrict the policy model pool to one or more routes (repeatable)",
+    )
+    subparser.add_argument("--rounds", type=int, default=default(1), help="Number of CRSI rounds (default: 1)")
+    subparser.add_argument("--candidates", type=int, default=default(2), help="Proposals sampled per round (default: 2)")
+    subparser.add_argument(
+        "--apply", action="store_true", default=default(False),
+        help="Apply the promoted candidate's edits to the workspace",
+    )
+    subparser.add_argument(
+        "--no-fallback", action="store_true", default=default(False),
+        help="Disable automatic fallback on specialist failure",
+    )
+    subparser.add_argument(
+        "--dry-run", action="store_true", default=argparse.SUPPRESS,
+        help="Synthesize proposals without invoking model backends",
+    )
+    subparser.add_argument(
+        "--scope", choices=["routes", "prompts", "full", "polyglot"], default=default(None),
+        help="Editable scope preset: routes, prompts, full, or polyglot (Rust/C/Zig/Go under native/)",
+    )
+    subparser.add_argument(
+        "--objective",
+        choices=["accuracy", "speed", "efficiency", "open-model", "open_model", "balanced"],
+        default=default("balanced"),
+        help="Optimization objective (default: balanced)",
+    )
+    subparser.add_argument(
+        "--profile", default=argparse.SUPPRESS,
+        help="Evaluate or evolve under a resolved Nexus profile",
+    )
+    _add_output_flags(subparser)
+    subparser.add_argument(
+        "-v", "--verbose", action="store_true", default=argparse.SUPPRESS,
+        help="Verbose status output (trace id, delegation tree, decisions)",
+    )
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="nexus",
+        description="Nexus: Unified Multi-Model CLI Harness, Entity Router & Delegation Visualizer",
+    )
+    parser.add_argument("--events-file", type=Path, default=DEFAULT_EVENTS_PATH, help="Path to events.jsonl telemetry bus")
+    parser.add_argument("--no-color", action="store_true", help="Disable ANSI color sequences")
+    parser.add_argument("-q", "--quiet", action="store_true", help="Only print the model answer and errors (no status lines or tree)")
+    parser.add_argument("-v", "--verbose", action="store_true", help="Add decision rationale, prompt preview, trace id, and timing breakdown")
+    parser.add_argument("--dry-run", action="store_true", help="Simulate delegation without invoking model backends")
+    parser.add_argument("-r", "--route", default=None, help="Explicit route override (e.g. code, reason, refactor, vision)")
+    parser.add_argument("--profile", default=None, help="Configuration profile name or JSON path (default, free-only, local-only, ensemble)")
+    parser.add_argument("--sticky", action="store_true", help="Use classic sticky orchestrator locking instead of unified entity routing")
+    parser.add_argument(
+        "--repl",
+        action="store_true",
+        help="Use line-oriented REPL instead of full-screen TUI",
+    )
+
+    subparsers = parser.add_subparsers(dest="subcommand")
+
+    p_run = subparsers.add_parser("run", help="Dispatch a prompt via the Front-Desk Decision Model or explicit route")
+    p_run.add_argument(
+        "-r", "--route", default=argparse.SUPPRESS, help="Explicit route key from routes.json"
+    )
+    p_run.add_argument("--profile", default=argparse.SUPPRESS, help="Configuration profile name or JSON path")
+    p_run.add_argument("-f", "--file", type=Path, default=None, help="Attach a file or image to the run")
+    p_run.add_argument("-o", "--out", type=Path, default=None, help="Save extracted code block or response to path")
+    p_run.add_argument("-s", "--session", default=None, help="Target an active OpenCode session ID")
+    p_run.add_argument("--decide", action="store_true", help="Use live Front-Desk Free Decision LLM instead of fast keyword routing")
+    p_run.add_argument(
+        "--dry-run", action="store_true", default=argparse.SUPPRESS,
+        help="Simulate execution without calling model backends",
+    )
+    p_run.add_argument("--no-tree", action="store_true", help="Suppress delegation tree output on stderr")
+    p_run.add_argument(
+        "--think", choices=list(THINK_LEVELS), default=None,
+        help="Thinking effort override (off/low/medium/high) for supported backends",
+    )
+    p_run.add_argument(
+        "--no-fallback", action="store_true",
+        help="Disable automatic fallback on OpenCode failure",
+    )
+    _add_output_flags(p_run)
+    p_run.add_argument(
+        "-v", "--verbose", action="store_true", default=argparse.SUPPRESS,
+        help="Verbose status output (rationale, prompt preview, trace id)",
+    )
+    p_run.add_argument("prompt", nargs="+", help="Prompt text (supports @route prefix)")
+
+    p_council = subparsers.add_parser("council", help="Run parallel 3-model Tripartite Council fan-out at zero-cost")
+    p_council.add_argument(
+        "--unified", action="store_true",
+        help="Synthesize parallel specialist drafts into one cohesive response",
+    )
+    p_council.add_argument("--profile", default=argparse.SUPPRESS, help="Configuration profile name or JSON path")
+    p_council.add_argument(
+        "--dry-run", action="store_true", default=argparse.SUPPRESS,
+        help="Simulate 3-seat council without calling backends",
+    )
+    p_council.add_argument(
+        "-v", "--verbose", action="store_true", default=argparse.SUPPRESS,
+        help="Verbose status output for each seat",
+    )
+    _add_output_flags(p_council)
+    p_council.add_argument("prompt", nargs="+", help="Question or design trade-off to adjudicate")
+
+    p_watch = subparsers.add_parser("watch", help="Watch live delegation tree from events.jsonl")
+    p_watch.add_argument("--trace", default=None, help="Filter to a specific trace_id")
+    p_watch.add_argument("--once", action="store_true", help="Render current tree once and exit")
+    p_watch.add_argument("--interval", type=float, default=0.25, help="Poll interval in seconds (default 0.25)")
+    _add_output_flags(p_watch)
+
+    p_routes = subparsers.add_parser("routes", help="List and validate specialist model routes")
+    p_routes.add_argument("--validate", action="store_true", help="Validate all pinned OpenCode models against `opencode models`")
+    p_routes.add_argument(
+        "--local", action="store_true",
+        help="Also probe local Ollama / OpenAI-compatible HTTP endpoints during --validate",
+    )
+    p_routes.add_argument(
+        "-q", "--quiet", action="store_true", default=argparse.SUPPRESS,
+        help="Only print a line when pins are broken (SessionStart hook)",
+    )
+    p_routes.add_argument("--no-color", action="store_true", default=argparse.SUPPRESS, help="Disable ANSI color sequences")
+    p_routes.add_argument("--refresh", action="store_true", help="Bypass the model-inventory cache during validation")
+
+    p_square = subparsers.add_parser("square", help="Shared single-machine Town Square (BOARD.md + square.jsonl)")
+    p_square.add_argument("--square-file", type=Path, default=DEFAULT_SQUARE_PATH, help="Path to square.jsonl")
+    p_square.add_argument("--board-file", type=Path, default=DEFAULT_BOARD_PATH, help="Path to BOARD.md")
+    p_square.add_argument("--digest", action="store_true", help="Print 1-line digest for SessionStart hook")
+    p_square.add_argument("-n", "--limit", type=int, default=10, help="Number of feed posts to show")
+    p_square.add_argument("-t", "--tag", default=None, help="Filter or tag posts (e.g. handoff, finding, note)")
+    _add_output_flags(p_square)
+    sq_sub = p_square.add_subparsers(dest="square_action")
+
+    p_sq_read = sq_sub.add_parser("read", help="Display BOARD.md and recent square.jsonl feed")
+    p_sq_read.add_argument("-n", "--limit", type=int, default=10)
+    p_sq_read.add_argument("-t", "--tag", default=None)
+
+    p_sq_post = sq_sub.add_parser("post", help="Append an atomic note/finding to square.jsonl")
+    p_sq_post.add_argument("-a", "--author", default="agent", help="Author harness/agent name")
+    p_sq_post.add_argument("-m", "--model", default="manual", help="Model ID")
+    p_sq_post.add_argument("-t", "--tag", default="note", help="Topic tag (e.g. finding, handoff, blocker)")
+    p_sq_post.add_argument("--verified", action="store_true", help="Mark entry as terminal-verified")
+    p_sq_post.add_argument("message", nargs="+", help="Post content")
+
+    p_sq_board = sq_sub.add_parser("board", help="View, set, or clear the pinned BOARD.md bulletin")
+    p_sq_board.add_argument("-a", "--author", default="agent", help="Author updating the board")
+    p_sq_board.add_argument("content", nargs="*", help="New markdown content (or 'clear')")
+
+    p_tui = subparsers.add_parser("tui", help="Launch the full-screen Textual TUI")
+    p_tui.add_argument("--theme", default=None, help="Initial theme (nexus-charcoal, oled-black, opencode-dark, github-slate, catppuccin-mocha)")
+    p_tui.add_argument("--no-sidebar", action="store_true", help="Start with the inspector sidebar hidden")
+    p_tui.add_argument("--profile", default=argparse.SUPPRESS, help="Initial profile name or JSON path")
+    p_tui.add_argument("--sticky", action="store_true", default=argparse.SUPPRESS, help="Use sticky orchestrator routing")
+    # `default=argparse.SUPPRESS` keeps a global `nexus --dry-run tui` from being
+    # silently reset to False by the subparser (see AGENTS.md).
+    p_tui.add_argument(
+        "--dry-run", action="store_true", default=argparse.SUPPRESS,
+        help="Simulate execution without calling model backends",
+    )
+    _add_output_flags(p_tui)
+    p_tui.add_argument(
+        "-v", "--verbose", action="store_true", default=argparse.SUPPRESS,
+        help="Verbose status detail and extra thinking/tool retention",
+    )
+
+    p_doctor = subparsers.add_parser("doctor", help="Audit binaries, routes, local endpoints, and Nexus state")
+    p_doctor.add_argument(
+        "--prune-events", action="store_true",
+        help="Trim events.jsonl to newest 2000 lines",
+    )
+    p_doctor.add_argument("--keep-lines", type=int, default=2000)
+    p_doctor.add_argument("--sim", type=Path, default=None, help="SIM ledger path to audit")
+    _add_output_flags(p_doctor)
+
+    p_sim = subparsers.add_parser("sim", help="Inspect and maintain the Self-Improvement Memory (SIM) ledger")
+    p_sim.add_argument("--sim", type=Path, default=None, help="SIM ledger path (default: NEXUS_SIM_PATH or ~/.local/state/nexus/sim.json)")
+    _add_output_flags(p_sim)
+    sim_sub = p_sim.add_subparsers(dest="sim_action")
+
+    p_sim_show = sim_sub.add_parser("show", help="Render the SIM ledger summary (default action)")
+    p_sim_show.add_argument("--json", action="store_true", help="Print the full ledger JSON instead of the summary")
+    p_sim_show.add_argument("--sim", type=Path, default=argparse.SUPPRESS, help="SIM ledger path")
+    _add_output_flags(p_sim_show)
+
+    p_sim_init = sim_sub.add_parser("init", help="Create a fresh SIM ledger")
+    p_sim_init.add_argument("--domain", default="nexus", help="Ledger domain label (default: nexus)")
+    p_sim_init.add_argument("--policy-model", default="", help="Policy model identifier recorded in context")
+    p_sim_init.add_argument("--benchmark", default="", help="Benchmark name recorded in context")
+    p_sim_init.add_argument("--force", action="store_true", help="Overwrite an existing ledger")
+    p_sim_init.add_argument("--sim", type=Path, default=argparse.SUPPRESS, help="SIM ledger path")
+    _add_output_flags(p_sim_init)
+
+    p_sim_carry = sim_sub.add_parser("carry", help="Carry a ledger forward into a new run")
+    p_sim_carry.add_argument("--from-file", type=Path, required=True, help="Source ledger to copy")
+    p_sim_carry.add_argument("--from-run", required=True, help="Source run label")
+    p_sim_carry.add_argument("--into-run", required=True, help="Destination run label")
+    p_sim_carry.add_argument("--sim", type=Path, default=argparse.SUPPRESS, help="Destination SIM ledger path")
+    _add_output_flags(p_sim_carry)
+
+    p_sim_merge = sim_sub.add_parser("merge", help="Merge one problem into another and alias the source")
+    p_sim_merge.add_argument("source_id", help="Problem id to merge away")
+    p_sim_merge.add_argument("target_id", help="Problem id that absorbs the source")
+    p_sim_merge.add_argument("--sim", type=Path, default=argparse.SUPPRESS, help="SIM ledger path")
+    _add_output_flags(p_sim_merge)
+
+    p_sim_compact = sim_sub.add_parser("compact", help="Distill dead ends and old attempts without losing provenance")
+    p_sim_compact.add_argument("--archive-dir", type=Path, default=None, help="Directory that receives the pre-compaction archive")
+    p_sim_compact.add_argument("--keep", type=int, default=3, help="Recent attempts retained per problem (default: 3)")
+    p_sim_compact.add_argument("--sim", type=Path, default=argparse.SUPPRESS, help="SIM ledger path")
+    _add_output_flags(p_sim_compact)
+
+    p_sim_validate = sim_sub.add_parser("validate", help="Audit the SIM ledger schema")
+    p_sim_validate.add_argument("--sim", type=Path, default=argparse.SUPPRESS, help="SIM ledger path")
+    _add_output_flags(p_sim_validate)
+
+    p_evolve = subparsers.add_parser(
+        "evolve", help="Run the CRSI self-improvement loop or evaluate a routing split"
+    )
+    _add_evolve_flags(p_evolve)
+    ev_sub = p_evolve.add_subparsers(dest="evolve_action")
+
+    p_ev_run = ev_sub.add_parser("run", help="Run CRSI rounds (default action)")
+    _add_evolve_flags(p_ev_run, suppress_existing=True)
+
+    p_ev_eval = ev_sub.add_parser("eval", help="Evaluate the evolve or held-out split")
+    p_ev_eval.add_argument(
+        "--split", choices=["evolve", "held-out", "held_out"], default="evolve",
+        help="Benchmark split to score (default: evolve)",
+    )
+    p_ev_eval.add_argument(
+        "--strict", action="store_true", help="Exit non-zero unless every task passes",
+    )
+    p_ev_eval.add_argument("--benchmark", type=Path, default=argparse.SUPPRESS, help="Benchmark spec JSON")
+    p_ev_eval.add_argument("--workspace", type=Path, default=argparse.SUPPRESS, help="Workspace to evaluate")
+    p_ev_eval.add_argument("--profile", default=argparse.SUPPRESS, help="Configuration profile to evaluate")
+    p_ev_eval.add_argument(
+        "--policy-route", dest="policy_routes", action="append", default=argparse.SUPPRESS,
+        help="Restrict the policy model pool to one or more routes (repeatable)",
+    )
+    _add_output_flags(p_ev_eval)
+
+    p_ev_chal = ev_sub.add_parser("challenge", help="Compare continued CRSI against a cold start on held-out")
+    p_ev_chal.add_argument("--seed-dir", type=Path, required=True, help="Pristine workspace for the fresh lineage")
+    _add_evolve_flags(p_ev_chal, suppress_existing=True)
+
+    p_ev_suggest = ev_sub.add_parser(
+        "suggest", help="Detect open-model squeezing, refactor, or polyglot opportunities"
+    )
+    p_ev_suggest.add_argument("--sim", type=Path, default=argparse.SUPPRESS, help="SIM ledger path")
+    p_ev_suggest.add_argument("--json", action="store_true", help="Output suggestions as JSON")
+    _add_output_flags(p_ev_suggest)
+
+    p_prof = subparsers.add_parser("profile", help="Manage Nexus entity configuration profiles")
+    _add_output_flags(p_prof)
+    prof_sub = p_prof.add_subparsers(dest="profile_action")
+
+    p_prof_list = prof_sub.add_parser("list", help="List available built-in and user profiles (default)")
+    p_prof_list.add_argument("--json", action="store_true", help="Print profile list as JSON")
+    _add_output_flags(p_prof_list)
+
+    p_prof_show = prof_sub.add_parser("show", help="Inspect a profile and its resolved routes")
+    p_prof_show.add_argument("name", nargs="?", default=DEFAULT_PROFILE_NAME, help="Profile name or JSON path")
+    p_prof_show.add_argument("--json", action="store_true", help="Print resolved profile as JSON")
+    _add_output_flags(p_prof_show)
+
+    p_prof_init = prof_sub.add_parser("init", help="Create a custom profile under ~/.config/nexus/profiles/")
+    p_prof_init.add_argument("name", help="New profile name")
+    p_prof_init.add_argument("--from", dest="base", default=None, help="Copy settings from an existing profile")
+    p_prof_init.add_argument("--mode", choices=["entity", "single", "ensemble"], default=None, help="Execution mode")
+    p_prof_init.add_argument("--default-route", default=None, help="Preferred default specialist route")
+    p_prof_init.add_argument("--persona", default=None, help="System persona text injected into turns")
+    p_prof_init.add_argument("--description", default=None, help="Short description")
+    _add_output_flags(p_prof_init)
+
+    p_stats = subparsers.add_parser("stats", help="Summarize execution latency, success rate, and quota share")
+    p_stats.add_argument("--by", choices=["profile", "route", "model"], default="profile", help="Grouping dimension")
+    p_stats.add_argument("--limit", type=int, default=2000, help="Number of tail events to inspect (default: 2000)")
+    p_stats.add_argument("--json", action="store_true", help="Output JSON metrics instead of a formatted table")
+    _add_output_flags(p_stats)
+
+    p_bench = subparsers.add_parser("bench", help="Benchmark multiple configuration profiles side-by-side")
+    p_bench.add_argument("--profiles", default=None, help="Comma-separated profile names (default: all discovered)")
+    p_bench.add_argument("--split", choices=["evolve", "held-out", "held_out"], default="evolve", help="Benchmark split")
+    p_bench.add_argument("--benchmark", type=Path, default=None, help="Benchmark spec JSON path")
+    p_bench.add_argument("--workspace", type=Path, default=None, help="Workspace root for base routes.json")
+    p_bench.add_argument("--json", action="store_true", help="Output benchmark rows as JSON")
+    _add_output_flags(p_bench)
+
+    return parser
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    raw_args = list(sys.argv[1:] if argv is None else argv)
+    known_subcommands = {
+        "run",
+        "council",
+        "watch",
+        "routes",
+        "square",
+        "tui",
+        "doctor",
+        "sim",
+        "evolve",
+        "profile",
+        "stats",
+        "bench",
+    }
+
+    # Allow bare `nexus "@reason Prompt"` or `nexus "Prompt"` shorthand, including
+    # when global flags come first (`nexus --dry-run "@code hello"`). Walk past
+    # flags and their values to find the first positional token.
+    value_flags = {"--events-file", "-r", "--route", "--profile"}
+    position = 0
+    implicit_index: Optional[int] = None
+    while position < len(raw_args):
+        token = raw_args[position]
+        if token in value_flags:
+            position += 2
+            continue
+        if token.startswith("-"):
+            position += 1
+            continue
+        if token not in known_subcommands:
+            implicit_index = position
+        break
+    if implicit_index is not None:
+        raw_args = raw_args[:implicit_index] + ["run"] + raw_args[implicit_index:]
+
+    parser = build_parser()
+    args = parser.parse_args(raw_args)
+    color = not args.no_color
+    verbosity = VERBOSITY_QUIET if getattr(args, "quiet", False) else VERBOSITY_DEFAULT
+    if getattr(args, "verbose", False):
+        verbosity = VERBOSITY_VERBOSE
+    tui_verbosity = (
+        verbosity
+        if (getattr(args, "quiet", False) or getattr(args, "verbose", False))
+        else None
+    )
+
+    profile_name = getattr(args, "profile", None)
+    sticky_flag = bool(getattr(args, "sticky", False))
+
+    try:
+        if args.subcommand == "profile":
+            return cmd_profile(args)
+
+        if args.subcommand == "stats":
+            return cmd_stats(args)
+
+        if args.subcommand == "bench":
+            return cmd_bench(args)
+
+        if args.subcommand == "tui":
+            try:
+                from nexus.tui import run_tui
+            except ImportError as exc:
+                print(f"nexus: full-screen TUI unavailable ({exc}); try `nexus --repl`", file=sys.stderr)
+                return 2
+            return run_tui(
+                events_path=args.events_file,
+                dry_run=args.dry_run,
+                verbosity=tui_verbosity,
+                theme=getattr(args, "theme", None),
+                show_sidebar=False if getattr(args, "no_sidebar", False) else None,
+                profile=profile_name,
+                entity_mode=False if sticky_flag else None,
+            )
+
+        if args.subcommand == "routes":
+            return cmd_routes(args)
+
+        if args.subcommand == "square":
+            return cmd_square(args)
+
+        if args.subcommand == "doctor":
+            return cmd_doctor(args)
+
+        if args.subcommand == "sim":
+            return cmd_sim(args)
+
+        if args.subcommand == "evolve":
+            return cmd_evolve(args)
+
+        if args.subcommand == "watch":
+            return watch_events(
+                events_path=args.events_file,
+                trace_id=args.trace,
+                interval_s=max(0.05, args.interval),
+                max_cycles=1 if args.once else None,
+                color=color,
+            )
+
+        selected_profile: Optional[EntityProfile] = None
+        if profile_name:
+            try:
+                selected_profile = load_profile(profile_name)
+            except (OSError, ValueError) as exc:
+                print(f"nexus: profile error: {exc}", file=sys.stderr)
+                return 2
+
+        if args.subcommand in ("run", "council"):
+            prompt_text = " ".join(args.prompt).strip()
+            if not prompt_text:
+                print(
+                    f'nexus: {args.subcommand} needs a prompt — e.g. nexus {args.subcommand} "..."',
+                    file=sys.stderr,
+                )
+                return 2
+        else:
+            prompt_text = ""
+
+        if args.subcommand == "council":
+            return run_council_fanout(
+                prompt_text,
+                events_path=args.events_file,
+                dry_run=args.dry_run,
+                color=color,
+                verbosity=verbosity,
+                unified=bool(getattr(args, "unified", False)),
+                profile=selected_profile,
+            )
+
+        if args.subcommand == "run":
+            return run_single_prompt(
+                prompt_text,
+                explicit_route=args.route,
+                attach_file=args.file,
+                session_id=args.session,
+                events_path=args.events_file,
+                dry_run=args.dry_run,
+                use_llm_decision=getattr(args, "decide", False),
+                color=color,
+                show_tree=not args.no_tree and verbosity >= VERBOSITY_DEFAULT,
+                verbosity=verbosity,
+                think=getattr(args, "think", None),
+                allow_fallback=not getattr(args, "no_fallback", False),
+                out_file=getattr(args, "out", None),
+                profile=selected_profile,
+            )
+
+        # No subcommand: prefer the full-screen TUI on an interactive terminal,
+        # and fall back to the line-oriented REPL for pipes, scripts and --repl.
+        if not getattr(args, "repl", False) and sys.stdin.isatty() and sys.stdout.isatty():
+            try:
+                from nexus.tui import run_tui
+            except ImportError:
+                pass
+            else:
+                return run_tui(
+                    events_path=args.events_file,
+                    dry_run=args.dry_run,
+                    verbosity=tui_verbosity,
+                    profile=profile_name,
+                    entity_mode=False if sticky_flag else None,
+                )
+
+        return run_repl(
+            events_path=args.events_file,
+            color=color,
+            dry_run=args.dry_run,
+            verbosity=verbosity,
+            profile_name=profile_name,
+            sticky=sticky_flag,
+        )
+    except KeyboardInterrupt:
+        print("\n[nexus] ^C Interrupted.", file=sys.stderr)
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())
