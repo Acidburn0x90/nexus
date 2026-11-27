@@ -19,6 +19,8 @@ from typing import Optional
 DEFAULT_EVENTS_PATH = Path.home() / ".local/state/nexus/events.jsonl"
 # Window used to find a trace without reading the whole append-only bus.
 _TRACE_TAIL_BYTES = 262144
+AUTO_PRUNE_MAX_BYTES = 2 * 1024 * 1024
+AUTO_PRUNE_KEEP_LINES = 2000
 
 # Span fields that must survive the merge as first non-empty value seen.
 _FIRST_WINS = ("parent_id", "route", "intent", "backend", "model", "quota_tier", "prompt", "profile")
@@ -64,6 +66,8 @@ def emit_event(
     elapsed_ms: int = 0,
     error: str = "",
     profile: str = "",
+    dry_run: bool = False,
+    auto_prune: bool = True,
     path: Optional[Path] = None,
 ) -> dict:
     """Append one span event to the bus and return the written record."""
@@ -88,13 +92,22 @@ def emit_event(
         "error": error[:512],
         "profile": str(profile or "")[:64],
     }
+    if dry_run:
+        record["dry_run"] = True
     payload = json.dumps(record, separators=(",", ":"), ensure_ascii=False) + "\n"
     target.parent.mkdir(parents=True, exist_ok=True)
+    size_after = 0
     fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
     try:
         os.write(fd, payload.encode("utf-8"))
+        size_after = os.fstat(fd).st_size
     finally:
         os.close(fd)
+    if auto_prune and size_after > AUTO_PRUNE_MAX_BYTES:
+        try:
+            prune_events(target, keep_lines=AUTO_PRUNE_KEEP_LINES)
+        except OSError:
+            pass
     return record
 
 
@@ -225,19 +238,14 @@ def prune_events(path: Optional[Path] = None, *, keep_lines: int = 2000) -> tupl
     return before, len(kept)
 
 
-def reconstruct_tree(events: list[dict], trace_id: Optional[str] = None) -> dict:
-    """Fold span events into a tree of merged spans plus a summary."""
-    active_trace = trace_id
-    if active_trace is None and events:
-        active_trace = events[-1].get("trace_id")
-
-    if active_trace is not None:
-        events = [event for event in events if event.get("trace_id") == active_trace]
-
+def merge_span_events(events: list[dict]) -> list[dict]:
+    """Fold chronologically ordered events into merged span records (preserving order)."""
     spans: dict[str, dict] = {}
     order: list[str] = []
 
     for event in events:
+        if not isinstance(event, dict):
+            continue
         span_id = event.get("span_id")
         if not span_id:
             continue
@@ -250,12 +258,43 @@ def reconstruct_tree(events: list[dict], trace_id: Optional[str] = None) -> dict
         ts = event.get("ts")
         if ts is not None and (merged.get("ts") is None or ts < merged["ts"]):
             merged["ts"] = ts
+        if event.get("dry_run"):
+            merged["dry_run"] = True
+
+        new_model = str(event.get("model") or "").strip()
+        old_model = str(merged.get("model") or "").strip()
+        new_backend = str(event.get("backend") or "").strip()
+        old_backend = str(merged.get("backend") or "").strip()
+        switched = (bool(new_model and old_model and new_model != old_model)) or (
+            bool(new_backend and old_backend and new_backend != old_backend)
+        )
+        if switched:
+            for field in ("route", "backend", "model", "quota_tier"):
+                if event.get(field):
+                    merged[field] = event[field]
+
         for field in _FIRST_WINS:
             if not merged.get(field) and event.get(field):
                 merged[field] = event[field]
         for field in _LAST_WINS:
             if field in event and event[field] not in (None, ""):
                 merged[field] = event[field]
+
+    return [spans[sid] for sid in order]
+
+
+def reconstruct_tree(events: list[dict], trace_id: Optional[str] = None) -> dict:
+    """Fold span events into a tree of merged spans plus a summary."""
+    active_trace = trace_id
+    if active_trace is None and events:
+        active_trace = events[-1].get("trace_id")
+
+    if active_trace is not None:
+        events = [event for event in events if event.get("trace_id") == active_trace]
+
+    merged_list = merge_span_events(events)
+    spans: dict[str, dict] = {sp["span_id"]: sp for sp in merged_list}
+    order: list[str] = [sp["span_id"] for sp in merged_list]
 
     children: dict[Optional[str], list[str]] = {}
     roots: list[str] = []

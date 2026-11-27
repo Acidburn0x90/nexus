@@ -263,5 +263,6 @@ Alongside the ten canonical SIM directives (`D1`–`D10`), the Proposer injects 
 
 Queued in `tasks/todo.md` under LifeOS's **ISA (Ideal State Articulation) + Errata** architecture:
 
-- **Verbatim Errata & False-Pass Capture:** Record user dissatisfaction and post-`DONE` false passes into an append-only `errata.jsonl` joined directly to `trace_id`, feeding `nexus evolve suggest` without placing LLMs on the interactive hot path.
+- **Verbatim Errata & False-Pass Capture (`nexus/errata.py`):** Records user complaints and post-`DONE` false passes verbatim into `~/.local/state/nexus/errata.jsonl` joined directly to `trace_id`, surfaced in `nexus evolve suggest` without placing LLMs on the interactive hot path.
+- **Assay Core Quality & Shadow Calibration (`nexus/assay.py`, `config/evals/core_quality_benchmark.json`):** Binds deterministic multi-domain checks (routing, >240-char tool-output compression, 3-scope health classification, latency budget) with SHA-256 receipts, staged gating (`UNMEASURED` on empty stages), and shadow router agreement tracking.
 - **Multi-Objective & GEPA Evolution:** Expand `nexus/evolve.py` with MAP-Elites/Pareto archives, trajectory-feedback prompt co-evolution, and sandbox network-egress / anti-reward-hacking guards.

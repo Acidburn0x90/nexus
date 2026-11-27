@@ -298,6 +298,25 @@ def is_explicit_only(route_key: str, cfg: dict) -> bool:
     return not cfg.get("keywords") and tier in ("LOCAL", "PREMIUM", "ARGON", "ARGON-QUOTA")
 
 
+_FAST_QA_ACTION_RE = re.compile(
+    r"\b(?:edit|create|write|refactor|run|commit|test|fix|bug|delete|install|script|code|implement|audit|debug|build|compile|patch|grep|search|file|repo)\b",
+    re.IGNORECASE,
+)
+_FAST_QA_PATH_RE = re.compile(
+    r"(?:^|\s)[.~/]?[\w.-]+/[\w.-]+|\b\w+\.(?:py|js|ts|tsx|json|md|rs|go|c|cpp|h|java|sh|tcss|toml|yaml|yml)\b",
+    re.IGNORECASE,
+)
+
+
+def _is_simple_qa_prompt(prompt: str) -> bool:
+    clean = (prompt or "").strip()
+    if not clean or len(clean) > 280 or "```" in clean:
+        return False
+    if _FAST_QA_PATH_RE.search(clean) or _FAST_QA_ACTION_RE.search(clean):
+        return False
+    return True
+
+
 def resolve_route(
     prompt: str,
     explicit_route: Optional[str] = None,
@@ -306,8 +325,8 @@ def resolve_route(
     """Resolve a prompt to (route_key, route_config, cleaned_prompt).
 
     Precedence: explicit flag, then a leading `@route` prefix, then keyword
-    scoring, then the configured default. Unknown explicit keys raise KeyError
-    so a typo can never silently fall back to a different model.
+    scoring, then optional `fast_qa_route`, then the configured default. Unknown
+    explicit keys raise KeyError so a typo can never silently fall back.
     """
     data = routes_data if routes_data is not None else load_routes()
     routes = data.get("routes", {})
@@ -338,6 +357,11 @@ def resolve_route(
         # `precedence`, so `triage`/`vision` win over the generic `code`.
         if score > best_score or (score == best_score and score > 0 and rank < best_rank):
             best_key, best_score, best_rank = key, score, rank
+
+    if best_score == 0:
+        fast_key = str(data.get("fast_qa_route") or "").strip()
+        if fast_key and fast_key in routes and _is_simple_qa_prompt(prompt):
+            best_key = fast_key
 
     return best_key, dict(routes.get(best_key, {})), prompt
 
@@ -418,6 +442,41 @@ def _fallback_decision(
     )
 
 
+def _http_front_desk_call(
+    endpoint: str,
+    model: str,
+    classifier_prompt: str,
+    *,
+    api_key: str = "",
+    timeout_s: float = 5.0,
+) -> tuple[str, int, int]:
+    """Query an OpenAI-compatible HTTP endpoint for single-line front-desk routing JSON."""
+    payload = json.dumps(
+        {
+            "model": model,
+            "messages": [{"role": "user", "content": classifier_prompt}],
+            "max_tokens": 96,
+            "temperature": 0.0,
+            "stream": False,
+        }
+    ).encode("utf-8")
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    req = urllib.request.Request(endpoint, data=payload, headers=headers, method="POST")
+    with _HTTP_OPENER.open(req, timeout=max(0.5, float(timeout_s))) as resp:
+        data = json.loads(resp.read().decode("utf-8", errors="replace"))
+    content = ""
+    choices = data.get("choices") or []
+    if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+        msg = choices[0].get("message") or {}
+        content = str(msg.get("content") or choices[0].get("text") or "").strip()
+    usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
+    tok_in = int(usage.get("prompt_tokens") or 0)
+    tok_out = int(usage.get("completion_tokens") or 0)
+    return content, tok_in, tok_out
+
+
 def front_desk_decide(
     prompt: str,
     *,
@@ -426,6 +485,8 @@ def front_desk_decide(
     use_llm: bool = True,
     timeout_s: float = 15.0,
     cancel_event: Optional[threading.Event] = None,
+    shadow_mode: Optional[bool] = None,
+    shadow_log_path: Optional[Path] = None,
 ) -> OrchestratorDecision:
     """Front-facing free decision model that selects which orchestrator takes charge."""
     data = routes_data if routes_data is not None else load_routes()
@@ -449,11 +510,11 @@ def front_desk_decide(
             elapsed_ms=1,
         )
 
-    # 2. Query the front-facing free decision model (`opencode/nemotron-3.5-lightning-free`)
+    # 2. Query the front-facing free decision model (direct HTTP if configured, else OpenCode)
     if cancel_event is not None and cancel_event.is_set():
         return _fallback_decision(prompt, data, decision_model, "cancelled before decision")
 
-    if use_llm:
+    def _run_llm_decision() -> tuple[Optional[dict], int, int, int, str]:
         route_catalog = ", ".join(
             f"{k} ({v.get('model')}: {v.get('description', '')})"
             for k, v in routes.items()
@@ -466,58 +527,122 @@ def front_desk_decide(
             f"Available routes: {route_catalog}, or set orchestrator='council' (route='free-reason') for multi-perspective architecture/security debates.\n"
             f"User request: {prompt[:500]}"
         )
+        dec_route_name = str(data.get("decision_route") or "").strip()
+        dec_route_cfg = routes.get(dec_route_name) if dec_route_name else None
+        dec_endpoint = str(data.get("decision_endpoint") or "").strip()
+        use_http = bool(
+            (isinstance(dec_route_cfg, dict) and dec_route_cfg.get("backend") in ("openai-compat", "colibri"))
+            or dec_endpoint
+        )
+        active_model = decision_model
         t0 = time.monotonic()
-        try:
-            from nexus.backends import _run_subprocess_bounded
+        raw_reply = ""
+        tok_in = tok_out = 0
 
-            _rc, out_raw, _err, _timed_out = _run_subprocess_bounded(
-                [
-                    "opencode",
-                    "run",
-                    "--auto",
-                    "--archived",
-                    "--format",
-                    "json",
-                    "--model",
-                    decision_model,
-                    "--",
+        if use_http:
+            cfg_ep = str((dec_route_cfg or {}).get("endpoint") or dec_endpoint)
+            active_model = str((dec_route_cfg or {}).get("model") or decision_model)
+            api_key = resolve_route_api_key(dec_route_cfg or {})
+            try:
+                raw_reply, tok_in, tok_out = _http_front_desk_call(
+                    cfg_ep,
+                    active_model,
                     classifier_prompt,
-                ],
-                timeout_s=timeout_s,
-                cancel_event=cancel_event,
-            )
-        except Exception:
-            out_raw = ""
+                    api_key=api_key,
+                    timeout_s=min(float(timeout_s), 5.0),
+                )
+            except Exception:
+                raw_reply = ""
+        else:
+            try:
+                from nexus.backends import _run_subprocess_bounded
 
-        if cancel_event is not None and cancel_event.is_set():
-            return _fallback_decision(prompt, data, decision_model, "cancelled before decision")
+                _rc, out_raw, _err, _timed_out = _run_subprocess_bounded(
+                    [
+                        "opencode",
+                        "run",
+                        "--auto",
+                        "--archived",
+                        "--format",
+                        "json",
+                        "--model",
+                        decision_model,
+                        "--",
+                        classifier_prompt,
+                    ],
+                    timeout_s=timeout_s,
+                    cancel_event=cancel_event,
+                )
+            except Exception:
+                out_raw = ""
+            raw_reply, tok_in, tok_out = _parse_decision_output(out_raw)
 
         elapsed_ms = int((time.monotonic() - t0) * 1000)
-        raw_reply, tok_in, tok_out = _parse_decision_output(out_raw)
         match = _JSON_OBJ_RE.search(raw_reply)
+        parsed = None
         if match:
             try:
-                parsed = json.loads(match.group(0))
+                cand = json.loads(match.group(0))
+                if isinstance(cand, dict):
+                    parsed = cand
             except json.JSONDecodeError:
                 parsed = None
-            if isinstance(parsed, dict):
-                orch = str(parsed.get("orchestrator", "opencode")).lower()
-                chosen_route = str(parsed.get("route", "code")).lstrip("@")
-                if chosen_route not in routes or is_explicit_only(chosen_route, routes[chosen_route]):
-                    chosen_route = resolve_route(prompt, routes_data=data)[0]
-                reason = str(parsed.get("reason") or f"delegated to @{chosen_route}")[:80]
-                return OrchestratorDecision(
-                    orchestrator="council" if orch == "council" else "opencode",
-                    route_key=chosen_route,
-                    route_cfg=dict(routes[chosen_route]),
-                    cleaned_prompt=prompt,
-                    take_charge=bool(parsed.get("take_charge", True)),
-                    reason=reason,
-                    decision_model=decision_model,
-                    tokens_in=tok_in or max(1, len(prompt) // 4),
-                    tokens_out=tok_out or 16,
-                    elapsed_ms=elapsed_ms,
-                )
+        return parsed, tok_in, tok_out, elapsed_ms, active_model
+
+    if use_llm:
+        is_shadow = bool(data.get("decision_shadow")) if shadow_mode is None else bool(shadow_mode)
+        if is_shadow:
+            kw_dec = _fallback_decision(prompt, data, decision_model)
+
+            def _record_shadow() -> None:
+                try:
+                    from nexus.assay import record_shadow_decision
+
+                    parsed, _ti, _to, elapsed_ms, active_model = _run_llm_decision()
+                    llm_route = ""
+                    if isinstance(parsed, dict):
+                        cand_r = str(parsed.get("route") or "").lstrip("@")
+                        if cand_r in routes and not is_explicit_only(cand_r, routes[cand_r]):
+                            llm_route = cand_r
+                    record_shadow_decision(
+                        prompt=prompt,
+                        keyword_route=kw_dec.route_key,
+                        llm_route=llm_route or kw_dec.route_key,
+                        agreed=bool(llm_route == kw_dec.route_key),
+                        elapsed_ms=elapsed_ms,
+                        decision_model=active_model,
+                        path=shadow_log_path,
+                    )
+                except Exception:
+                    pass
+
+            if shadow_log_path is not None:
+                _record_shadow()
+            else:
+                threading.Thread(target=_record_shadow, daemon=True).start()
+            return kw_dec
+
+        parsed, tok_in, tok_out, elapsed_ms, active_model = _run_llm_decision()
+        if cancel_event is not None and cancel_event.is_set():
+            return _fallback_decision(prompt, data, decision_model, "cancelled before decision")
+        if isinstance(parsed, dict):
+            orch = str(parsed.get("orchestrator", "opencode")).lower()
+            chosen_route = str(parsed.get("route", "code")).lstrip("@")
+            if chosen_route not in routes or is_explicit_only(chosen_route, routes[chosen_route]):
+                chosen_route = resolve_route(prompt, routes_data=data)[0]
+            reason = str(parsed.get("reason") or f"delegated to @{chosen_route}")[:80]
+            return OrchestratorDecision(
+                orchestrator="council" if orch == "council" else "opencode",
+                route_key=chosen_route,
+                route_cfg=dict(routes[chosen_route]),
+                cleaned_prompt=prompt,
+                take_charge=bool(parsed.get("take_charge", True)),
+                reason=reason,
+                decision_model=active_model,
+                tokens_in=tok_in or max(1, len(prompt) // 4),
+                tokens_out=tok_out or 16,
+                elapsed_ms=elapsed_ms,
+            )
 
     # 3. Fast deterministic keyword fallback
     return _fallback_decision(prompt, data, decision_model)

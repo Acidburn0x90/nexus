@@ -663,6 +663,7 @@ class HelpModal(ModalScreen[None]):
         ("/square", "town square"),
         ("/post", "post a note"),
         ("/board", "pin the board"),
+        ("/erratum", "log false-pass"),
         ("/new", "new session"),
         ("/sessions", "session list"),
         ("/theme", "switch theme"),

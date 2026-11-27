@@ -402,6 +402,7 @@ def _validate_tasks(raw: object, split: str, source: Path) -> list[dict]:
     for index, task in enumerate(raw):
         if not isinstance(task, dict):
             raise ValueError(f"benchmark at {source}: {split} task[{index}] must be an object")
+        kind = str(task.get("kind") or "routing").strip().lower()
         tid = str(task.get("id") or "").strip()
         prompt = str(task.get("prompt") or "")
         expected = str(task.get("expected_route") or "").strip()
@@ -411,13 +412,14 @@ def _validate_tasks(raw: object, split: str, source: Path) -> list[dict]:
             raise ValueError(f"benchmark at {source}: duplicate task id '{tid}' in {split}")
         if not prompt:
             raise ValueError(f"benchmark at {source}: task '{tid}' is missing 'prompt'")
-        if not expected:
+        if kind == "routing" and not expected:
             raise ValueError(f"benchmark at {source}: task '{tid}' is missing 'expected_route'")
         seen.add(tid)
         entry = dict(task)
         entry["id"] = tid
         entry["prompt"] = prompt
-        entry["expected_route"] = expected
+        if expected:
+            entry["expected_route"] = expected
         if entry.get("forbidden_routes"):
             entry["forbidden_routes"] = [str(route) for route in task["forbidden_routes"]]
         tasks.append(entry)
@@ -720,6 +722,96 @@ def evaluate_split(
             latency_ms=reported_latency,
             tokens_total=reported_tokens,
             metrics=reported_metrics,
+        )
+
+    if spec.verifier == "builtin:core_quality":
+        from nexus.assay import build_assay_receipt
+        from nexus.backends import _bounded_history, classify_http_error
+
+        routes_path = workspace / "config" / "routes.json"
+        routes_data = load_routes(routes_path)
+        routes_raw = routes_path.read_bytes() if routes_path.is_file() else json.dumps(routes_data).encode("utf-8")
+
+        results: dict[str, bool] = {}
+        traces: dict[str, str] = {}
+        stages: list[dict] = []
+        latencies_ms: list[float] = []
+        comp_ratios: list[float] = []
+
+        for task in tasks:
+            tid = str(task["id"])
+            kind = str(task.get("kind") or "routing")
+            t0 = time.monotonic()
+            ok = False
+            detail = ""
+            if kind == "routing":
+                try:
+                    got, _cfg, _cleaned = resolve_route(str(task["prompt"]), routes_data=routes_data)
+                    exp = str(task["expected_route"])
+                    ok = got == exp
+                    detail = f"got={got} expected={exp}"
+                except Exception as exc:
+                    detail = f"routing error: {exc}"
+            elif kind == "compression":
+                turns = max(4, int(task.get("turns", 8)))
+                tool_chars = max(260, int(task.get("tool_chars", 900)))
+                min_ratio = float(task.get("min_savings_ratio", 0.35))
+                hist = []
+                for idx in range(turns - 3):
+                    hist.append({"role": "user", "content": f"turn {idx}"})
+                    hist.append({"role": "assistant", "content": "[Tool output: scan]\n" + ("a" * tool_chars)})
+                for idx in range(3):
+                    hist.append({"role": "user", "content": f"recent ask {idx}"})
+                    hist.append({"role": "assistant", "content": f"recent answer {idx}"})
+                orig_chars = sum(len(m["content"]) for m in hist)
+                kept_chars = sum(len(m["content"]) for m in _bounded_history(hist))
+                ratio = (orig_chars - kept_chars) / max(1, orig_chars)
+                comp_ratios.append(ratio)
+                ok = ratio >= min_ratio
+                detail = f"savings={ratio:.2%} min={min_ratio:.2%}"
+            elif kind == "health_classify":
+                pairs = task.get("inputs") or []
+                mismatches = []
+                for inp, exp in pairs:
+                    got = classify_http_error(inp)
+                    if got != exp:
+                        mismatches.append(f"{inp!r}->{got}!={exp}")
+                ok = bool(pairs) and not mismatches
+                detail = "ok" if ok else ", ".join(mismatches)
+            elif kind == "latency_budget":
+                resolve_route(str(task.get("prompt") or ""), routes_data=routes_data)
+                dt_ms = (time.monotonic() - t0) * 1000.0
+                latencies_ms.append(dt_ms)
+                max_ms = float(task.get("max_ms", 50.0))
+                ok = dt_ms <= max_ms
+                detail = f"elapsed={dt_ms:.2f}ms max={max_ms:.1f}ms"
+            else:
+                detail = f"unsupported core_quality task kind '{kind}'"
+
+            results[tid] = ok
+            if not ok:
+                traces[tid] = detail
+            stages.append({"name": f"{tid}:{kind}", "passed": ok, "detail": detail})
+
+        receipt = build_assay_receipt(
+            routes_raw,
+            ideal_state=f"{spec.name} ({split})",
+            stages=stages,
+            target=spec.name,
+        )
+        metrics: dict[str, float] = {
+            "assay_passed": float(receipt["passed"]),
+            "assay_total": float(receipt["total"]),
+            "compression_ratio": round(sum(comp_ratios) / len(comp_ratios), 4) if comp_ratios else 0.0,
+            "routing_latency_ms": round(max(latencies_ms), 3) if latencies_ms else 0.0,
+        }
+        return _report(
+            split,
+            results,
+            traces,
+            policy_models,
+            latency_ms=sum(latencies_ms) if latencies_ms else 1.0,
+            metrics=metrics,
         )
 
     raise ValueError(f"unsupported verifier '{spec.verifier}' for benchmark '{spec.name}'")
@@ -1552,6 +1644,7 @@ def _run_candidate(
         "touched": [],
         "scope_ok": False,
         "error": "",
+        "failure_class": "",
         "accepted": False,
         "recorded": False,
         "optimizer_model": "",
@@ -1598,6 +1691,7 @@ def _run_candidate(
             intent_label="evolve:propose",
         )
         if result is None:
+            candidate["failure_class"] = "backend_error"
             candidate["error"] = f"proposer dispatch failed: {dispatch_error}"
         else:
             raw_output = result.output
@@ -1605,6 +1699,7 @@ def _run_candidate(
             tokens_in, tokens_out = result.tokens_in, result.tokens_out
             elapsed_ms = result.elapsed_ms
             if result.status != "DONE" and not raw_output.strip():
+                candidate["failure_class"] = "backend_error"
                 candidate["error"] = (
                     f"proposer backend {result.status}: {result.error or 'no output'}"
                 )
@@ -1613,12 +1708,48 @@ def _run_candidate(
         try:
             proposal = parse_json_object(raw_output)
         except ValueError as exc:
-            candidate["error"] = f"proposal rejected: {type(exc).__name__}: {exc}"
+            repaired_raw = ""
+            if raw_output.strip():
+                repair_prompt = (
+                    "Convert your previous response into ONLY a valid single JSON object matching: "
+                    '{"problem_id":"new","problem_name":"...","tier":"adaptable","action":"new","what":"...","predicted":[],"edits":[{"path":"...","mode":"write","content":"..."}]}. '
+                    f"Parse error was: {exc}\n\nOriginal output:\n{raw_output[:4000]}"
+                )
+                if optimizer_fn is not None:
+                    repaired_raw = str(optimizer_fn("proposer_repair", repair_prompt) or "")
+                    tokens_in += max(1, len(repair_prompt) // 4)
+                    tokens_out += max(1, len(repaired_raw) // 4)
+                else:
+                    r_res, _r_err = _execute_route_span(
+                        trace_id,
+                        round_span,
+                        workspace,
+                        proposer_route,
+                        repair_prompt,
+                        events_path=events_path,
+                        allow_fallback=allow_fallback,
+                        intent_label="evolve:propose-repair",
+                    )
+                    if r_res is not None:
+                        repaired_raw = r_res.output
+                        tokens_in += r_res.tokens_in
+                        tokens_out += r_res.tokens_out
+                        elapsed_ms += r_res.elapsed_ms
+            if repaired_raw.strip():
+                try:
+                    proposal = parse_json_object(repaired_raw)
+                except ValueError as exc2:
+                    candidate["failure_class"] = "parse_error"
+                    candidate["error"] = f"proposal rejected: {type(exc2).__name__}: {exc2}"
+            else:
+                candidate["failure_class"] = "parse_error"
+                candidate["error"] = f"proposal rejected: {type(exc).__name__}: {exc}"
     if proposal is not None and not candidate["error"]:
         try:
             _merge_proposal(candidate, proposal)
             _assert_no_proposal_leak(candidate, spec)
         except ValueError as exc:
+            candidate["failure_class"] = "parse_error"
             candidate["error"] = f"proposal rejected: {type(exc).__name__}: {exc}"
             # A leaky proposal must leave no trace in the SIM ledger: drop
             # every field the proposal contributed before the fallback text.
@@ -1633,8 +1764,10 @@ def _run_candidate(
                 workspace, spec, candidate["edits"], policy
             )
         except PermissionError as exc:
+            candidate["failure_class"] = "scope_violation"
             candidate["error"] = f"scope violation: {type(exc).__name__}: {exc}"
         except ValueError as exc:
+            candidate["failure_class"] = "scope_violation"
             candidate["error"] = f"edits rejected: {type(exc).__name__}: {exc}"
         else:
             sandboxes[sample_id] = (sandbox_root, tempdir)
@@ -1708,6 +1841,7 @@ def _run_candidate(
         tokens_out=tokens_out,
         elapsed_ms=elapsed_ms,
         error=candidate["error"][:500],
+        dry_run=dry_run,
         path=events_path,
     )
     return candidate
@@ -1764,6 +1898,7 @@ def run_evolve_round(
         quota_tier="ORCHESTRATOR",
         status="RUNNING",
         step=f"round {round_num} start ({obj}) on benchmark '{spec.name}'",
+        dry_run=dry_run,
         path=events_path,
     )
 
@@ -1912,6 +2047,7 @@ def run_evolve_round(
                     f"selection mode {selection_mode}: winner "
                     f"{winner['sample'] if winner is not None else 'none'}"
                 ),
+                dry_run=dry_run,
                 path=events_path,
             )
 
@@ -1956,6 +2092,7 @@ def run_evolve_round(
                 f"winner {summary['winner']}, promoted {promoted}, applied {applied}"
             ),
             elapsed_ms=int((time.monotonic() - started) * 1000),
+            dry_run=dry_run,
             path=events_path,
         )
         return summary
@@ -1972,6 +2109,7 @@ def run_evolve_round(
             step=f"round {round_num} failed",
             error=str(exc)[:500],
             elapsed_ms=int((time.monotonic() - started) * 1000),
+            dry_run=dry_run,
             path=events_path,
         )
         raise
@@ -2213,6 +2351,7 @@ def detect_improvement_opportunities(
     *,
     ledger: Optional[dict] = None,
     routes_data: Optional[dict] = None,
+    errata: Optional[list[dict]] = None,
 ) -> list[dict]:
     """Scan telemetry and SIM dead ends for concrete optimization opportunities."""
     from nexus.entity import compute_performance_stats
@@ -2312,6 +2451,41 @@ def detect_improvement_opportunities(
                             "existing OSS methods before refactoring harness or native/ code."
                         ),
                         "command": "nexus evolve --scope full --objective balanced",
+                    }
+                )
+
+    if errata:
+        by_route_err: dict[str, dict[str, int]] = {}
+        for item in errata:
+            if not isinstance(item, dict):
+                continue
+            rt = str(item.get("route") or "unknown").strip().lstrip("@") or "unknown"
+            bucket = by_route_err.setdefault(rt, {"total": 0, "false_passes": 0})
+            bucket["total"] += 1
+            if item.get("false_pass"):
+                bucket["false_passes"] += 1
+        for rt, counts in by_route_err.items():
+            if counts["false_passes"] >= 1 or counts["total"] >= 2:
+                opportunities.append(
+                    {
+                        "id": f"errata-false-pass:{rt}",
+                        "priority": "high",
+                        "lever": "prompt_tune|profile_tune|code_refactor",
+                        "target": f"@{rt}",
+                        "evidence": (
+                            f"{counts['total']} erratum(a) ({counts['false_passes']} false-pass) "
+                            "captured on completed runs"
+                        ),
+                        "open_question": (
+                            f"Why did @{rt} accumulate {counts['total']} user erratum(a) "
+                            f"({counts['false_passes']} false-pass despite DONE), and what ISA/Assay "
+                            "check catches this failure before exit?"
+                        ),
+                        "recommendation": (
+                            "Inspect `nexus errata list --route "
+                            f"{rt}`, encode a verifiable Assay stage check, and tighten persona/routing."
+                        ),
+                        "command": "nexus errata list",
                     }
                 )
 

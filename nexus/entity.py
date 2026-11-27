@@ -12,7 +12,7 @@ import tempfile
 import time
 from typing import Any, Optional
 
-from nexus.events import _FIRST_WINS, _LAST_WINS, normalize_quota_tier
+from nexus.events import merge_span_events, normalize_quota_tier
 from nexus.router import load_routes
 from nexus.visualizer import (
     BOLD,
@@ -406,41 +406,39 @@ def _percentile(sorted_vals: list[int], pct: float) -> int:
 
 
 def _merge_spans(events: list[dict]) -> list[dict]:
-    spans: dict[str, dict] = {}
-    order: list[str] = []
-    for event in events:
-        if not isinstance(event, dict):
-            continue
-        span_id = event.get("span_id")
-        if not span_id:
-            continue
-        if span_id not in spans:
-            spans[span_id] = dict(event)
-            order.append(span_id)
-            continue
-        merged = spans[span_id]
-        for field_name in _FIRST_WINS:
-            if not merged.get(field_name) and event.get(field_name):
-                merged[field_name] = event[field_name]
-        for field_name in _LAST_WINS:
-            if field_name in event and event[field_name] not in (None, ""):
-                merged[field_name] = event[field_name]
-    return [spans[sid] for sid in order]
+    return merge_span_events(events)
 
 
-def compute_performance_stats(events: list[dict], *, group_by: str = "profile") -> dict:
+def _is_dry_run_span(sp: dict) -> bool:
+    if bool(sp.get("dry_run")):
+        return True
+    return str(sp.get("step") or "").strip().lower() == "dry-run complete"
+
+
+def compute_performance_stats(
+    events: list[dict],
+    *,
+    group_by: str = "profile",
+    include_dry_run: bool = False,
+) -> dict:
     """Aggregate execution telemetry across completed/failed spans by profile, route, or model."""
     if group_by not in ("profile", "route", "model"):
         raise ValueError(f"invalid group_by '{group_by}'; expected profile, route, or model")
 
     merged = _merge_spans(events)
     terminal_statuses = {"DONE", "FAIL", "TIMEOUT", "INTERRUPTED"}
-    leaf_spans = [
+    all_leaf = [
         sp
         for sp in merged
         if normalize_quota_tier(str(sp.get("quota_tier") or "")) != "ORCHESTRATOR"
         and str(sp.get("status") or "").upper() in terminal_statuses
     ]
+    if include_dry_run:
+        leaf_spans = all_leaf
+        excluded_dry_run = 0
+    else:
+        leaf_spans = [sp for sp in all_leaf if not _is_dry_run_span(sp)]
+        excluded_dry_run = len(all_leaf) - len(leaf_spans)
 
     buckets: dict[str, list[dict]] = {}
     for sp in leaf_spans:
@@ -487,6 +485,7 @@ def compute_performance_stats(events: list[dict], *, group_by: str = "profile") 
     return {
         "group_by": group_by,
         "total_runs": len(leaf_spans),
+        "excluded_dry_run": excluded_dry_run,
         "groups": groups,
     }
 

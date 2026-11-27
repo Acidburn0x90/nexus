@@ -38,6 +38,7 @@ from textual.widgets import Static, TextArea
 
 from nexus.backends import ExecutionResult, execute_route
 from nexus.drops import save_text_artifact
+from nexus.errata import record_erratum
 from nexus.entity import (
     DEFAULT_PROFILE_NAME,
     EntityProfile,
@@ -142,6 +143,7 @@ SLASH_COMMANDS: list[tuple[str, str, str]] = [
     ("/square", "", "Show the Town Square board and feed"),
     ("/post", "<msg>", "Post a note to the Town Square"),
     ("/board", "<txt>", "Update the pinned BOARD.md (or 'clear')"),
+    ("/erratum", "<note>", "Log a verbatim complaint or false pass joined to last trace"),
     ("/new", "", "Open a fresh session"),
     ("/sessions", "", "Switch, create or delete a session"),
     ("/theme", "[name]", "Switch the TUI theme"),
@@ -233,6 +235,7 @@ class NexusCommandProvider(Provider):
             ("Toggle UI mode (WebUI / CLI)", f"Ctrl+G · current: {app.ui_mode}", app.action_toggle_ui_mode),
             ("Copy last assistant response", "/copy · clipboard via OSC 52 or wl-copy", app.action_copy_last),
             ("Save last code block to drop folder", "/save [filename] · writes to drops folder", app.prefill_save),
+            ("Log erratum / false pass", "/erratum <note> · capture verbatim failure joined to trace", app.prefill_erratum),
             ("Launch external harness TUI", "/tui · open external CLI TUI for this session", app.action_launch_tui),
             ("Show shortcuts & commands help", "F1 or ? · keyboard and slash reference", app.action_show_help),
             ("Quit Nexus", "Ctrl+Q · exit the full-screen console", app.action_quit_app),
@@ -1374,6 +1377,9 @@ class NexusApp(App[None]):
     def prefill_save(self) -> None:
         self.prefill_composer("/save ")
 
+    def prefill_erratum(self) -> None:
+        self.prefill_composer("/erratum ")
+
     def _current_line(self) -> tuple[str, int, int]:
         try:
             area = self.query_one(ComposerBox).input
@@ -1771,6 +1777,8 @@ class NexusApp(App[None]):
             self._post_square(argument)
         elif command == "/board":
             self._update_board(argument)
+        elif command in ("/erratum", "/bad"):
+            self._record_erratum(argument)
         elif command == "/new":
             self.action_new_session_tab()
         elif command == "/sessions":
@@ -1883,6 +1891,39 @@ class NexusApp(App[None]):
         except Exception:
             pass
         self._mount_note("SIM LEDGER", summary)
+
+    def _record_erratum(self, body: str) -> None:
+        note = (body or "").strip()
+        if not note:
+            self.notify("Usage: /erratum <complaint or false-pass note>", severity="warning", timeout=3)
+            return
+        session = self.active_session
+        trace_id = ""
+        route = ""
+        model = ""
+        if session is not None:
+            for item in reversed(session.items):
+                if getattr(item, "trace_id", ""):
+                    trace_id = str(item.trace_id)
+                    route = str(item.route or "")
+                    model = str(item.model or "")
+                    break
+            route = route or session.pinned_route or session.last_route or session.active_route or ""
+            model = model or session.active_model or ""
+        try:
+            rec = record_erratum(
+                note,
+                trace_id=trace_id,
+                route=route,
+                model=model,
+                source="tui",
+                events_path=self.events_path,
+            )
+        except (OSError, ValueError) as exc:
+            self.notify(f"Erratum failed: {exc}", severity="error", timeout=4)
+            return
+        fp_tag = " [FALSE-PASS]" if rec.get("false_pass") else ""
+        self.notify(f"Erratum {rec['id']}{fp_tag} logged ({rec['route'] or 'unknown'})", timeout=3)
 
     def _post_square(self, body: str) -> None:
         if not body:

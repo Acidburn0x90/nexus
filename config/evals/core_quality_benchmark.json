@@ -1,0 +1,88 @@
+{
+  "name": "nexus-core-quality-v1",
+  "domain": "core-quality",
+  "verifier": "builtin:core_quality",
+  "editable_files": [
+    "config/routes.json",
+    "nexus/router.py",
+    "nexus/backends.py"
+  ],
+  "evolve_tasks": [
+    {
+      "id": "cq_r1",
+      "kind": "routing",
+      "prompt": "audit the auth boundary and prove invariants",
+      "expected_route": "reason"
+    },
+    {
+      "id": "cq_r2",
+      "kind": "routing",
+      "prompt": "summarize these CI failure logs quickly",
+      "expected_route": "triage"
+    },
+    {
+      "id": "cq_c1",
+      "kind": "compression",
+      "prompt": "compress old bulky tool output history beyond 3 recent turns",
+      "turns": 8,
+      "tool_chars": 900,
+      "min_savings_ratio": 0.4
+    },
+    {
+      "id": "cq_h1",
+      "kind": "health_classify",
+      "prompt": "classify 401/429/503/400 HTTP failure scopes",
+      "inputs": [
+        [401, "auth"],
+        [429, "quota"],
+        [503, "transient"],
+        [400, "other"]
+      ]
+    },
+    {
+      "id": "cq_l1",
+      "kind": "latency_budget",
+      "prompt": "write a quick python snippet",
+      "max_ms": 50.0
+    }
+  ],
+  "held_out_tasks": [
+    {
+      "id": "cq_hr1",
+      "kind": "routing",
+      "prompt": "refactor the payment adapter across multiple modules",
+      "expected_route": "refactor"
+    },
+    {
+      "id": "cq_hr2",
+      "kind": "routing",
+      "prompt": "analyze this screenshot for UI layout bugs",
+      "expected_route": "vision"
+    },
+    {
+      "id": "cq_hc1",
+      "kind": "compression",
+      "prompt": "compress 10-turn bulky tool output history",
+      "turns": 10,
+      "tool_chars": 1200,
+      "min_savings_ratio": 0.45
+    },
+    {
+      "id": "cq_hh1",
+      "kind": "health_classify",
+      "prompt": "classify 403/402/408/timeout HTTP failure scopes",
+      "inputs": [
+        [403, "auth"],
+        [402, "quota"],
+        [408, "transient"],
+        ["timed out", "transient"]
+      ]
+    },
+    {
+      "id": "cq_hl1",
+      "kind": "latency_budget",
+      "prompt": "inspect long repository architecture across 500k tokens",
+      "max_ms": 50.0
+    }
+  ]
+}

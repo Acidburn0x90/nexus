@@ -1441,7 +1441,18 @@ def test_cli_profile_stats_bench_unified_council_and_sim(tmp_path: Path, monkeyp
         check=True,
     )
     stats_payload = json.loads(stats_proc.stdout)
-    assert "free-only" in stats_payload.get("groups", {})
+    assert stats_payload.get("excluded_dry_run", 0) >= 1
+    assert "free-only" not in stats_payload.get("groups", {})
+
+    stats_all_proc = subprocess.run(
+        [sys.executable, str(bin_path), "--events-file", str(events_file), "--no-color", "stats", "--by", "profile", "--include-dry-run", "--json"],
+        capture_output=True,
+        text=True,
+        env=env,
+        check=True,
+    )
+    stats_all_payload = json.loads(stats_all_proc.stdout)
+    assert "free-only" in stats_all_payload.get("groups", {})
 
     bench_proc = subprocess.run(
         [

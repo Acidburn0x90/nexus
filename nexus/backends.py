@@ -319,6 +319,7 @@ def _emit(
     elapsed_ms: int = 0,
     error: str = "",
     profile: str = "",
+    dry_run: bool = False,
     events_path: Path = DEFAULT_EVENTS_PATH,
     on_event: StepCallback = None,
 ) -> dict:
@@ -339,6 +340,7 @@ def _emit(
         elapsed_ms=elapsed_ms,
         error=error,
         profile=profile,
+        dry_run=dry_run,
         path=events_path,
     )
     if on_event is not None:
@@ -999,6 +1001,7 @@ def execute_route(
     handoff_context: str = "",
     profile: str = "",
     routes_path: Optional[Path] = None,
+    _fallback_depth: int = 0,
 ) -> ExecutionResult:
     """Execute a single delegated span against its configured harness backend."""
     span_id = span_id or new_span_id()
@@ -1038,6 +1041,7 @@ def execute_route(
         step=f"dispatch->{backend}:{model}",
         prompt=prompt[:240],
         profile=profile,
+        dry_run=dry_run,
         events_path=events_path,
         on_event=on_event,
     )
@@ -1063,6 +1067,7 @@ def execute_route(
             tokens_out=max(1, len(out) // 4),
             elapsed_ms=elapsed_ms,
             profile=profile,
+            dry_run=True,
             events_path=events_path,
             on_event=on_event,
         )
@@ -1243,6 +1248,80 @@ def execute_route(
         spin_thread.start()
 
     try:
+        def _resolve_fallback_route(from_key: str, from_cfg: dict) -> Optional[tuple[str, dict]]:
+            fb_key = str(from_cfg.get("fallback_route") or "").strip()
+            if not fb_key or fb_key == from_key:
+                return None
+            all_routes = load_routes(routes_path).get("routes", {})
+            fb_cfg = all_routes.get(fb_key)
+            if not isinstance(fb_cfg, dict):
+                return None
+            if fb_cfg.get("backend") not in ("opencode", "openai-compat", "colibri", "ollama"):
+                return None
+            return fb_key, dict(fb_cfg)
+
+        def _handoff_to_fallback_route(fb_key: str, fb_cfg: dict) -> ExecutionResult:
+            fb_backend = str(fb_cfg.get("backend", "opencode"))
+            fb_model = str(fb_cfg.get("model", ""))
+            fb_tier = str(fb_cfg.get("quota_tier", "FREE"))
+            _emit(
+                trace_id,
+                span_id,
+                parent_id=parent_id,
+                route=fb_key,
+                intent=intent,
+                backend=fb_backend,
+                model=fb_model,
+                quota_tier=fb_tier,
+                status="RUNNING",
+                step=f"fallback->{fb_key}:{fb_model}",
+                elapsed_ms=int((time.monotonic() - t0) * 1000),
+                profile=profile,
+                dry_run=dry_run,
+                events_path=events_path,
+                on_event=on_event,
+            )
+            if on_stream is not None:
+                on_stream("status", f"fallback -> @{fb_key} ({fb_tier})")
+            if emit_stderr and _status_enabled(verbosity):
+                print(
+                    status_line("warn", f"{_route_label(route_key)} · fallback -> @{fb_key} ({fb_tier})", color=enabled),
+                    file=sys.stderr,
+                )
+            think_printer.flush()
+            think_printer.reset_attempt()
+            stop_spinner_once()
+            return execute_route(
+                trace_id,
+                fb_key,
+                fb_cfg,
+                prompt,
+                parent_id=parent_id,
+                span_id=span_id,
+                attach_file=attach_file,
+                session_id=None,
+                events_path=events_path,
+                square_path=square_path,
+                board_path=board_path,
+                inject_square=inject_square,
+                on_event=on_event,
+                dry_run=dry_run,
+                color=color,
+                verbosity=verbosity,
+                on_stream=on_stream,
+                cancel_event=cancel_event,
+                emit_stderr=emit_stderr,
+                history_messages=history_messages,
+                think=think,
+                allow_fallback=False,
+                drop_dir=drop_dir,
+                system_persona=system_persona,
+                handoff_context=handoff_context,
+                profile=profile,
+                routes_path=routes_path,
+                _fallback_depth=_fallback_depth + 1,
+            )
+
         if backend == "opencode":
 
             def _opencode_attempt(run_model: str, run_tier: str) -> tuple[ExecutionResult, bool]:
@@ -1479,7 +1558,17 @@ def execute_route(
                     )
                 think_printer.flush()
                 think_printer.reset_attempt()
-                result, _ = _opencode_attempt(fb_model, fb_tier)
+                result, saw_opencode_text = _opencode_attempt(fb_model, fb_tier)
+            if (
+                result.status in ("FAIL", "TIMEOUT")
+                and allow_fallback
+                and _fallback_depth == 0
+                and not saw_opencode_text
+                and classify_http_error(result.error) != "auth"
+            ):
+                fb_route_target = _resolve_fallback_route(route_key, route_cfg)
+                if fb_route_target is not None:
+                    return _handoff_to_fallback_route(*fb_route_target)
             return _finish(result)
 
         if backend in ("openai-compat", "colibri", "ollama"):
@@ -1493,18 +1582,6 @@ def execute_route(
                         "http://127.0.0.1:8000/v1/chat/completions" if kind == "openai-compat" else "http://127.0.0.1:11434/api/chat",
                     )
                 )
-
-            def _resolve_http_fallback(from_key: str, from_cfg: dict) -> Optional[tuple[str, dict]]:
-                fb_key = str(from_cfg.get("fallback_route") or "").strip()
-                if not fb_key or fb_key == from_key:
-                    return None
-                all_routes = load_routes(routes_path).get("routes", {})
-                fb_cfg = all_routes.get(fb_key)
-                if not isinstance(fb_cfg, dict):
-                    return None
-                if fb_cfg.get("backend") not in ("openai-compat", "colibri", "ollama"):
-                    return None
-                return fb_key, fb_cfg
 
             def _http_attempt(attempt_route: str, attempt_cfg: dict) -> tuple[ExecutionResult, bool]:
                 a_backend = attempt_cfg.get("backend", backend)
@@ -1814,26 +1891,32 @@ def execute_route(
 
             primary_kind = "ollama" if backend == "ollama" else "openai-compat"
             primary_ep = _http_endpoint(route_cfg, primary_kind)
-            fb_target = _resolve_http_fallback(route_key, route_cfg) if allow_fallback else None
+            fb_target = _resolve_fallback_route(route_key, route_cfg) if (allow_fallback and _fallback_depth == 0) else None
             if fb_target and _HEALTH_TRACKER.is_cooled_down(endpoint=primary_ep, route_key=route_key, model=model):
                 fb_key, fb_cfg = fb_target
-                fb_kind = "ollama" if fb_cfg.get("backend") == "ollama" else "openai-compat"
-                fb_ep = _http_endpoint(fb_cfg, fb_kind)
-                if not _HEALTH_TRACKER.is_cooled_down(endpoint=fb_ep, route_key=fb_key, model=str(fb_cfg.get("model", ""))):
-                    if on_stream is not None:
-                        on_stream("status", f"cooldown fallback -> @{fb_key}")
-                    result, _ = _http_attempt(fb_key, fb_cfg)
-                    return _finish(result)
+                if fb_cfg.get("backend") in ("openai-compat", "colibri", "ollama"):
+                    fb_kind = "ollama" if fb_cfg.get("backend") == "ollama" else "openai-compat"
+                    fb_ep = _http_endpoint(fb_cfg, fb_kind)
+                    if not _HEALTH_TRACKER.is_cooled_down(endpoint=fb_ep, route_key=fb_key, model=str(fb_cfg.get("model", ""))):
+                        if on_stream is not None:
+                            on_stream("status", f"cooldown fallback -> @{fb_key}")
+                        result, _ = _http_attempt(fb_key, fb_cfg)
+                        return _finish(result)
+                else:
+                    return _handoff_to_fallback_route(fb_key, fb_cfg)
 
             result, saw_first_byte = _http_attempt(route_key, route_cfg)
             if (
                 result.status in ("FAIL", "TIMEOUT")
                 and allow_fallback
+                and _fallback_depth == 0
                 and not saw_first_byte
                 and classify_http_error(result.error) != "auth"
                 and fb_target is not None
             ):
                 fb_key, fb_cfg = fb_target
+                if fb_cfg.get("backend") not in ("openai-compat", "colibri", "ollama"):
+                    return _handoff_to_fallback_route(fb_key, fb_cfg)
                 fb_model = str(fb_cfg.get("model", ""))
                 fb_tier = str(fb_cfg.get("quota_tier", "FREE"))
                 _emit(
@@ -1849,6 +1932,7 @@ def execute_route(
                     step=f"fallback->{fb_key}:{fb_model}",
                     elapsed_ms=int((time.monotonic() - t0) * 1000),
                     profile=profile,
+                    dry_run=dry_run,
                     events_path=events_path,
                     on_event=on_event,
                 )
